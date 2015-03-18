@@ -4,16 +4,21 @@ import (
 	"container/list"
 	"crypto/tls"
 	"fmt"
-	"github.com/hashicorp/yamux"
-	"github.com/inconshreveable/muxado"
-	"github.com/ugorji/go/codec"
 	"io"
 	"net"
 	"net/rpc"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/hashicorp/consul/tlsutil"
+	"github.com/hashicorp/go-msgpack/codec"
+	"github.com/hashicorp/yamux"
+	"github.com/inconshreveable/muxado"
 )
+
+// msgpackHandle is a shared handle for encoding/decoding of RPC messages
+var msgpackHandle = &codec.MsgpackHandle{}
 
 // muxSession is used to provide an interface for either muxado or yamux
 type muxSession interface {
@@ -79,7 +84,7 @@ func (c *Conn) getClient() (*StreamClient, error) {
 	}
 
 	// Create the RPC client
-	cc := codec.GoRpc.ClientCodec(stream, &codec.MsgpackHandle{})
+	cc := codec.GoRpc.ClientCodec(stream, msgpackHandle)
 	client := rpc.NewClientWithCodec(cc)
 
 	// Return a new stream client
@@ -109,7 +114,7 @@ func (c *Conn) returnClient(client *StreamClient) {
 // Consul servers. This is used to reduce the latency of
 // RPC requests between servers. It is only used to pool
 // connections in the rpcConsul mode. Raft connections
-// are pooled seperately.
+// are pooled separately.
 type ConnPool struct {
 	sync.Mutex
 
@@ -218,7 +223,12 @@ func (p *ConnPool) getNewConn(addr net.Addr, version int) (*Conn, error) {
 		}
 
 		// Wrap the connection in a TLS client
-		conn = tls.Client(conn, p.tlsConfig)
+		tlsConn, err := tlsutil.WrapTLSClient(conn, p.tlsConfig)
+		if err != nil {
+			conn.Close()
+			return nil, err
+		}
+		conn = tlsConn
 	}
 
 	// Switch the multiplexing based on version
@@ -242,7 +252,7 @@ func (p *ConnPool) getNewConn(addr net.Addr, version int) (*Conn, error) {
 
 		// Setup the logger
 		conf := yamux.DefaultConfig()
-		conf.LogOutput = nil
+		conf.LogOutput = p.logOutput
 
 		// Create a multiplexed session
 		session, _ = yamux.Client(conn, conf)
@@ -285,7 +295,7 @@ func (p *ConnPool) clearConn(conn *Conn) {
 	p.Unlock()
 
 	// Close down immediately if idle
-	if refCount := atomic.LoadInt32(&conn.shouldClose); refCount == 0 {
+	if refCount := atomic.LoadInt32(&conn.refCount); refCount == 0 {
 		conn.Close()
 	}
 }
@@ -348,12 +358,12 @@ func (p *ConnPool) RPC(addr net.Addr, version int, method string, args interface
 
 // Reap is used to close conns open over maxTime
 func (p *ConnPool) reap() {
-	for !p.shutdown {
+	for {
 		// Sleep for a while
 		select {
-		case <-time.After(time.Second):
 		case <-p.shutdownCh:
 			return
+		case <-time.After(time.Second):
 		}
 
 		// Reap all old conns

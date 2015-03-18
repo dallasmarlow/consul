@@ -2,6 +2,8 @@
 layout: "docs"
 page_title: "Upgrading Consul"
 sidebar_current: "docs-upgrading-upgrading"
+description: |-
+  Consul is meant to be a long-running agent on any nodes participating in a Consul cluster. These nodes consistently communicate with each other. As such, protocol level compatibility and ease of upgrades is an important thing to keep in mind when using Consul.
 ---
 
 # Upgrading Consul
@@ -13,10 +15,36 @@ keep in mind when using Consul.
 
 This page documents how to upgrade Consul when a new version is released.
 
-## Upgrading Consul
+## Standard Upgrades
 
-In short, upgrading Consul is a short series of easy steps. For the steps
-below, assume you're running version A of Consul, and then version B comes out.
+For upgrades we strive to ensure backwards compatibility. To support this,
+nodes gossip their protocol version and builds. This enables clients and
+servers to intelligently enable new features when available, or to gracefully
+fallback to a backward compatible mode of operation otherwise.
+
+For most upgrades, the process is simple. Assuming the current version of
+Consul is A, and version B is released.
+
+1. On each server, install version B of Consul.
+
+2. Shut down version A, restart with version B.
+
+3. Once all the servers are upgraded, begin a rollout of clients following
+   the same process.
+
+4. Done! You are now running the latest Consul agent. You can verify this
+   by running `consul members` to make sure all members have the latest
+   build and highest protocol version.
+
+
+## Backward Incompatible Upgrades
+
+In some cases, a backwards incompatible update may be released. This has not
+been an issue yet, but to support upgrades we support setting an explicit
+protocol version. This disables incompatible features and enables a 2-phase upgrade.
+
+For the steps below, assume you're running version A of Consul, and then
+version B comes out.
 
 1. On each node, install version B of Consul.
 
@@ -59,9 +87,7 @@ only specifies the protocol version to _speak_. Every Consul agent can
 always understand the entire range of protocol versions it claims to
 on `consul -v`.
 
-<div class="alert alert-block alert-warning">
-<strong>By running a previous protocol version</strong>, some features
+~> **By running a previous protocol version**, some features
 of Consul, especially newer features, may not be available. If this is the
 case, Consul will typically warn you. In general, you should always upgrade
 your cluster so that you can run the latest protocol version.
-</div>

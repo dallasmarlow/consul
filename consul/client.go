@@ -3,8 +3,6 @@ package consul
 import (
 	"crypto/tls"
 	"fmt"
-	"github.com/hashicorp/consul/consul/structs"
-	"github.com/hashicorp/serf/serf"
 	"log"
 	"math/rand"
 	"os"
@@ -13,6 +11,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hashicorp/consul/consul/structs"
+	"github.com/hashicorp/serf/serf"
 )
 
 const (
@@ -80,6 +81,11 @@ func NewClient(config *Config) (*Client, error) {
 		return nil, fmt.Errorf("Config must provide a DataDir")
 	}
 
+	// Sanity check the ACLs
+	if err := config.CheckACL(); err != nil {
+		return nil, err
+	}
+
 	// Ensure we have a log output
 	if config.LogOutput == nil {
 		config.LogOutput = os.Stderr
@@ -88,10 +94,8 @@ func NewClient(config *Config) (*Client, error) {
 	// Create the tlsConfig
 	var tlsConfig *tls.Config
 	var err error
-	if config.VerifyOutgoing {
-		if tlsConfig, err = config.OutgoingTLSConfig(); err != nil {
-			return nil, err
-		}
+	if tlsConfig, err = config.tlsConfig().OutgoingTLSConfig(); err != nil {
+		return nil, err
 	}
 
 	// Create a logger
@@ -128,12 +132,14 @@ func (c *Client) setupSerf(conf *serf.Config, ch chan serf.Event, path string) (
 	conf.Tags["vsn"] = fmt.Sprintf("%d", c.config.ProtocolVersion)
 	conf.Tags["vsn_min"] = fmt.Sprintf("%d", ProtocolVersionMin)
 	conf.Tags["vsn_max"] = fmt.Sprintf("%d", ProtocolVersionMax)
+	conf.Tags["build"] = c.config.Build
 	conf.MemberlistConfig.LogOutput = c.config.LogOutput
 	conf.LogOutput = c.config.LogOutput
 	conf.EventCh = ch
 	conf.SnapshotPath = filepath.Join(c.config.DataDir, path)
 	conf.ProtocolVersion = protocolVersionMap[c.config.ProtocolVersion]
 	conf.RejoinAfterLeave = c.config.RejoinAfterLeave
+	conf.Merge = &lanMergeDelegate{dc: c.config.Datacenter}
 	if err := ensurePath(conf.SnapshotPath, false); err != nil {
 		return nil, err
 	}
@@ -195,6 +201,21 @@ func (c *Client) LANMembers() []serf.Member {
 // RemoveFailedNode is used to remove a failed node from the cluster
 func (c *Client) RemoveFailedNode(node string) error {
 	return c.serf.RemoveFailedNode(node)
+}
+
+// UserEvent is used to fire an event via the Serf layer
+func (c *Client) UserEvent(name string, payload []byte) error {
+	return c.serf.UserEvent(userEventName(name), payload, false)
+}
+
+// KeyManagerLAN returns the LAN Serf keyring manager
+func (c *Client) KeyManagerLAN() *serf.KeyManager {
+	return c.serf.KeyManager()
+}
+
+// Encrypted determines if gossip is encrypted
+func (c *Client) Encrypted() bool {
+	return c.serf.EncryptionEnabled()
 }
 
 // lanEventHandler is used to handle events from the lan Serf cluster
@@ -291,13 +312,21 @@ func (c *Client) localEvent(event serf.UserEvent) {
 		return
 	}
 
-	switch event.Name {
-	case newLeaderEvent:
+	switch name := event.Name; {
+	case name == newLeaderEvent:
 		c.logger.Printf("[INFO] consul: New leader elected: %s", event.Payload)
 
 		// Trigger the callback
 		if c.config.ServerUp != nil {
 			c.config.ServerUp()
+		}
+	case isUserEvent(name):
+		event.Name = rawUserEventName(name)
+		c.logger.Printf("[DEBUG] consul: user event: %s", event.Name)
+
+		// Trigger the callback
+		if c.config.UserEventHandler != nil {
+			c.config.UserEventHandler(event)
 		}
 	default:
 		c.logger.Printf("[WARN] consul: Unhandled local event: %v", event)

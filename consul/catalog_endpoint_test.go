@@ -2,14 +2,15 @@ package consul
 
 import (
 	"fmt"
-	"github.com/hashicorp/consul/consul/structs"
-	"github.com/hashicorp/consul/testutil"
 	"net/rpc"
 	"os"
 	"sort"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hashicorp/consul/consul/structs"
+	"github.com/hashicorp/consul/testutil"
 )
 
 func TestCatalogRegister(t *testing.T) {
@@ -42,6 +43,61 @@ func TestCatalogRegister(t *testing.T) {
 	}, func(err error) {
 		t.Fatalf("err: %v", err)
 	})
+}
+
+func TestCatalogRegister_ACLDeny(t *testing.T) {
+	dir1, s1 := testServerWithConfig(t, func(c *Config) {
+		c.ACLDatacenter = "dc1"
+		c.ACLMasterToken = "root"
+		c.ACLDefaultPolicy = "deny"
+	})
+	defer os.RemoveAll(dir1)
+	defer s1.Shutdown()
+	client := rpcClient(t, s1)
+	defer client.Close()
+
+	testutil.WaitForLeader(t, client.Call, "dc1")
+
+	// Create the ACL
+	arg := structs.ACLRequest{
+		Datacenter: "dc1",
+		Op:         structs.ACLSet,
+		ACL: structs.ACL{
+			Name:  "User token",
+			Type:  structs.ACLTypeClient,
+			Rules: testRegisterRules,
+		},
+		WriteRequest: structs.WriteRequest{Token: "root"},
+	}
+	var out string
+	if err := client.Call("ACL.Apply", &arg, &out); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	id := out
+
+	argR := structs.RegisterRequest{
+		Datacenter: "dc1",
+		Node:       "foo",
+		Address:    "127.0.0.1",
+		Service: &structs.NodeService{
+			Service: "db",
+			Tags:    []string{"master"},
+			Port:    8000,
+		},
+		WriteRequest: structs.WriteRequest{Token: id},
+	}
+	var outR struct{}
+
+	err := client.Call("Catalog.Register", &argR, &outR)
+	if err == nil || !strings.Contains(err.Error(), permissionDenied) {
+		t.Fatalf("err: %v", err)
+	}
+
+	argR.Service.Service = "foo"
+	err = client.Call("Catalog.Register", &argR, &outR)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
 }
 
 func TestCatalogRegister_ForwardLeader(t *testing.T) {
@@ -220,13 +276,13 @@ func TestCatalogListNodes(t *testing.T) {
 	})
 
 	// Server node is auto added from Serf
-	if out.Nodes[0].Node != s1.config.NodeName {
+	if out.Nodes[1].Node != s1.config.NodeName {
 		t.Fatalf("bad: %v", out)
 	}
-	if out.Nodes[1].Node != "foo" {
+	if out.Nodes[0].Node != "foo" {
 		t.Fatalf("bad: %v", out)
 	}
-	if out.Nodes[1].Address != "127.0.0.1" {
+	if out.Nodes[0].Address != "127.0.0.1" {
 		t.Fatalf("bad: %v", out)
 	}
 }
@@ -434,7 +490,7 @@ func TestCatalogListServices(t *testing.T) {
 
 	// Just add a node
 	s1.fsm.State().EnsureNode(1, structs.Node{"foo", "127.0.0.1"})
-	s1.fsm.State().EnsureService(2, "foo", &structs.NodeService{"db", "db", []string{"primary"}, 5000})
+	s1.fsm.State().EnsureService(2, "foo", &structs.NodeService{"db", "db", []string{"primary"}, "127.0.0.1", 5000})
 
 	if err := client.Call("Catalog.ListServices", &args, &out); err != nil {
 		t.Fatalf("err: %v", err)
@@ -488,7 +544,7 @@ func TestCatalogListServices_Blocking(t *testing.T) {
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 		s1.fsm.State().EnsureNode(1, structs.Node{"foo", "127.0.0.1"})
-		s1.fsm.State().EnsureService(2, "foo", &structs.NodeService{"db", "db", []string{"primary"}, 5000})
+		s1.fsm.State().EnsureService(2, "foo", &structs.NodeService{"db", "db", []string{"primary"}, "127.0.0.1", 5000})
 	}()
 
 	// Re-run the query
@@ -569,7 +625,7 @@ func TestCatalogListServices_Stale(t *testing.T) {
 
 	// Inject a fake service
 	s1.fsm.State().EnsureNode(1, structs.Node{"foo", "127.0.0.1"})
-	s1.fsm.State().EnsureService(2, "foo", &structs.NodeService{"db", "db", []string{"primary"}, 5000})
+	s1.fsm.State().EnsureService(2, "foo", &structs.NodeService{"db", "db", []string{"primary"}, "127.0.0.1", 5000})
 
 	// Run the query, do not wait for leader!
 	if err := client.Call("Catalog.ListServices", &args, &out); err != nil {
@@ -610,7 +666,7 @@ func TestCatalogListServiceNodes(t *testing.T) {
 
 	// Just add a node
 	s1.fsm.State().EnsureNode(1, structs.Node{"foo", "127.0.0.1"})
-	s1.fsm.State().EnsureService(2, "foo", &structs.NodeService{"db", "db", []string{"primary"}, 5000})
+	s1.fsm.State().EnsureService(2, "foo", &structs.NodeService{"db", "db", []string{"primary"}, "127.0.0.1", 5000})
 
 	if err := client.Call("Catalog.ServiceNodes", &args, &out); err != nil {
 		t.Fatalf("err: %v", err)
@@ -653,8 +709,8 @@ func TestCatalogNodeServices(t *testing.T) {
 
 	// Just add a node
 	s1.fsm.State().EnsureNode(1, structs.Node{"foo", "127.0.0.1"})
-	s1.fsm.State().EnsureService(2, "foo", &structs.NodeService{"db", "db", []string{"primary"}, 5000})
-	s1.fsm.State().EnsureService(3, "foo", &structs.NodeService{"web", "web", nil, 80})
+	s1.fsm.State().EnsureService(2, "foo", &structs.NodeService{"db", "db", []string{"primary"}, "127.0.0.1", 5000})
+	s1.fsm.State().EnsureService(3, "foo", &structs.NodeService{"web", "web", nil, "127.0.0.1", 80})
 
 	if err := client.Call("Catalog.NodeServices", &args, &out); err != nil {
 		t.Fatalf("err: %v", err)
@@ -670,7 +726,7 @@ func TestCatalogNodeServices(t *testing.T) {
 	if !strContains(services["db"].Tags, "primary") || services["db"].Port != 5000 {
 		t.Fatalf("bad: %v", out)
 	}
-	if services["web"].Tags != nil || services["web"].Port != 80 {
+	if len(services["web"].Tags) != 0 || services["web"].Port != 80 {
 		t.Fatalf("bad: %v", out)
 	}
 }
@@ -721,3 +777,9 @@ func TestCatalogRegister_FailedCase1(t *testing.T) {
 		t.Fatalf("Bad: %v", out2)
 	}
 }
+
+var testRegisterRules = `
+service "foo" {
+	policy = "write"
+}
+`

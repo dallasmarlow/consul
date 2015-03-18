@@ -1,14 +1,15 @@
 package main
 
 import (
+	"os"
+	"os/signal"
+
 	"github.com/hashicorp/consul/command"
 	"github.com/hashicorp/consul/command/agent"
 	"github.com/mitchellh/cli"
-	"os"
-	"os/signal"
 )
 
-// Commands is the mapping of all the available Serf commands.
+// Commands is the mapping of all the available Consul commands.
 var Commands map[string]cli.CommandFactory
 
 func init() {
@@ -17,8 +18,24 @@ func init() {
 	Commands = map[string]cli.CommandFactory{
 		"agent": func() (cli.Command, error) {
 			return &agent.Command{
+				Revision:          GitCommit,
+				Version:           Version,
+				VersionPrerelease: VersionPrerelease,
+				Ui:                ui,
+				ShutdownCh:        make(chan struct{}),
+			}, nil
+		},
+
+		"event": func() (cli.Command, error) {
+			return &command.EventCommand{
+				Ui: ui,
+			}, nil
+		},
+
+		"exec": func() (cli.Command, error) {
+			return &command.ExecCommand{
+				ShutdownCh: makeShutdownCh(),
 				Ui:         ui,
-				ShutdownCh: make(chan struct{}),
 			}, nil
 		},
 
@@ -40,8 +57,27 @@ func init() {
 			}, nil
 		},
 
+		"keyring": func() (cli.Command, error) {
+			return &command.KeyringCommand{
+				Ui: ui,
+			}, nil
+		},
+
 		"leave": func() (cli.Command, error) {
 			return &command.LeaveCommand{
+				Ui: ui,
+			}, nil
+		},
+
+		"lock": func() (cli.Command, error) {
+			return &command.LockCommand{
+				ShutdownCh: makeShutdownCh(),
+				Ui:         ui,
+			}, nil
+		},
+
+		"maint": func() (cli.Command, error) {
+			return &command.MaintCommand{
 				Ui: ui,
 			}, nil
 		},
@@ -65,12 +101,34 @@ func init() {
 			}, nil
 		},
 
+		"reload": func() (cli.Command, error) {
+			return &command.ReloadCommand{
+				Ui: ui,
+			}, nil
+		},
+
 		"version": func() (cli.Command, error) {
+			ver := Version
+			rel := VersionPrerelease
+			if GitDescribe != "" {
+				ver = GitDescribe
+			}
+			if GitDescribe == "" && rel == "" {
+				rel = "dev"
+			}
+
 			return &command.VersionCommand{
 				Revision:          GitCommit,
-				Version:           Version,
-				VersionPrerelease: VersionPrerelease,
+				Version:           ver,
+				VersionPrerelease: rel,
 				Ui:                ui,
+			}, nil
+		},
+
+		"watch": func() (cli.Command, error) {
+			return &command.WatchCommand{
+				ShutdownCh: makeShutdownCh(),
+				Ui:         ui,
 			}, nil
 		},
 	}

@@ -2,7 +2,7 @@ package consul
 
 import (
 	"github.com/hashicorp/consul/testutil"
-	"github.com/ugorji/go/codec"
+	"github.com/hashicorp/go-msgpack/codec"
 	"net"
 	"net/rpc"
 	"os"
@@ -19,7 +19,7 @@ func rpcClient(t *testing.T, s *Server) *rpc.Client {
 	// Write the Consul RPC byte to set the mode
 	conn.Write([]byte{byte(rpcConsul)})
 
-	cc := codec.GoRpc.ClientCodec(conn, &codec.MsgpackHandle{})
+	cc := codec.GoRpc.ClientCodec(conn, msgpackHandle)
 	return rpc.NewClientWithCodec(cc)
 }
 

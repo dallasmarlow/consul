@@ -3,6 +3,10 @@
         @include transition(border-color .2s ease-in-out);
         @include transition(box-shadow .2s ease-in-out);
         @include transition(border-color .2s ease-in-out);
+
+        &.form-control-mini {
+            font-size: 12px;
+        }
     }
 
     &.valid {
@@ -15,4 +19,8 @@
     .input-group-addon {
         background-color: $gray-background;
     }
+}
+
+textarea.form-control {
+    height: 130px;
 }

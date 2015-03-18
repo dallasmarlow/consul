@@ -1,17 +1,30 @@
 package agent
 
 import (
-	"bytes"
+	"crypto/tls"
 	"encoding/json"
-	"github.com/hashicorp/consul/consul/structs"
-	"github.com/mitchellh/mapstructure"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"os"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/hashicorp/consul/consul/structs"
+	"github.com/hashicorp/consul/tlsutil"
+	"github.com/mitchellh/mapstructure"
+)
+
+var (
+	// scadaHTTPAddr is the address associated with the
+	// HTTPServer. When populating an ACL token for a request,
+	// this is checked to switch between the ACLToken and
+	// AtlasACLToken
+	scadaHTTPAddr = "SCADA"
 )
 
 // HTTPServer is used to wrap an Agent and expose various API's
@@ -22,38 +35,158 @@ type HTTPServer struct {
 	listener net.Listener
 	logger   *log.Logger
 	uiDir    string
+	addr     string
 }
 
-// NewHTTPServer starts a new HTTP server to provide an interface to
+// NewHTTPServers starts new HTTP servers to provide an interface to
 // the agent.
-func NewHTTPServer(agent *Agent, uiDir string, enableDebug bool, logOutput io.Writer, bind string) (*HTTPServer, error) {
-	// Create the mux
-	mux := http.NewServeMux()
+func NewHTTPServers(agent *Agent, config *Config, scada net.Listener, logOutput io.Writer) ([]*HTTPServer, error) {
+	var servers []*HTTPServer
 
-	// Create listener
-	list, err := net.Listen("tcp", bind)
+	if config.Ports.HTTPS > 0 {
+		httpAddr, err := config.ClientListener(config.Addresses.HTTPS, config.Ports.HTTPS)
+		if err != nil {
+			return nil, err
+		}
+
+		tlsConf := &tlsutil.Config{
+			VerifyIncoming: config.VerifyIncoming,
+			VerifyOutgoing: config.VerifyOutgoing,
+			CAFile:         config.CAFile,
+			CertFile:       config.CertFile,
+			KeyFile:        config.KeyFile,
+			NodeName:       config.NodeName,
+			ServerName:     config.ServerName}
+
+		tlsConfig, err := tlsConf.IncomingTLSConfig()
+		if err != nil {
+			return nil, err
+		}
+
+		ln, err := net.Listen(httpAddr.Network(), httpAddr.String())
+		if err != nil {
+			return nil, fmt.Errorf("Failed to get Listen on %s: %v", httpAddr.String(), err)
+		}
+
+		list := tls.NewListener(tcpKeepAliveListener{ln.(*net.TCPListener)}, tlsConfig)
+
+		// Create the mux
+		mux := http.NewServeMux()
+
+		// Create the server
+		srv := &HTTPServer{
+			agent:    agent,
+			mux:      mux,
+			listener: list,
+			logger:   log.New(logOutput, "", log.LstdFlags),
+			uiDir:    config.UiDir,
+			addr:     httpAddr.String(),
+		}
+		srv.registerHandlers(config.EnableDebug)
+
+		// Start the server
+		go http.Serve(list, mux)
+		servers = append(servers, srv)
+	}
+
+	if config.Ports.HTTP > 0 {
+		httpAddr, err := config.ClientListener(config.Addresses.HTTP, config.Ports.HTTP)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to get ClientListener address:port: %v", err)
+		}
+
+		// Error if we are trying to bind a domain socket to an existing path
+		socketPath, isSocket := unixSocketAddr(config.Addresses.HTTP)
+		if isSocket {
+			if _, err := os.Stat(socketPath); !os.IsNotExist(err) {
+				agent.logger.Printf("[WARN] agent: Replacing socket %q", socketPath)
+			}
+			if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
+				return nil, fmt.Errorf("error removing socket file: %s", err)
+			}
+		}
+
+		ln, err := net.Listen(httpAddr.Network(), httpAddr.String())
+		if err != nil {
+			return nil, fmt.Errorf("Failed to get Listen on %s: %v", httpAddr.String(), err)
+		}
+
+		var list net.Listener
+		if isSocket {
+			// Set up ownership/permission bits on the socket file
+			if err := setFilePermissions(socketPath, config.UnixSockets); err != nil {
+				return nil, fmt.Errorf("Failed setting up HTTP socket: %s", err)
+			}
+			list = ln
+		} else {
+			list = tcpKeepAliveListener{ln.(*net.TCPListener)}
+		}
+
+		// Create the mux
+		mux := http.NewServeMux()
+
+		// Create the server
+		srv := &HTTPServer{
+			agent:    agent,
+			mux:      mux,
+			listener: list,
+			logger:   log.New(logOutput, "", log.LstdFlags),
+			uiDir:    config.UiDir,
+			addr:     httpAddr.String(),
+		}
+		srv.registerHandlers(config.EnableDebug)
+
+		// Start the server
+		go http.Serve(list, mux)
+		servers = append(servers, srv)
+	}
+
+	if scada != nil {
+		// Create the mux
+		mux := http.NewServeMux()
+
+		// Create the server
+		srv := &HTTPServer{
+			agent:    agent,
+			mux:      mux,
+			listener: scada,
+			logger:   log.New(logOutput, "", log.LstdFlags),
+			uiDir:    config.UiDir,
+			addr:     scadaHTTPAddr,
+		}
+		srv.registerHandlers(false) // Never allow debug for SCADA
+
+		// Start the server
+		go http.Serve(scada, mux)
+		servers = append(servers, srv)
+	}
+
+	return servers, nil
+}
+
+// tcpKeepAliveListener sets TCP keep-alive timeouts on accepted
+// connections. It's used by NewHttpServer so
+// dead TCP connections eventually go away.
+type tcpKeepAliveListener struct {
+	*net.TCPListener
+}
+
+func (ln tcpKeepAliveListener) Accept() (c net.Conn, err error) {
+	tc, err := ln.AcceptTCP()
 	if err != nil {
-		return nil, err
+		return
 	}
-
-	// Create the server
-	srv := &HTTPServer{
-		agent:    agent,
-		mux:      mux,
-		listener: list,
-		logger:   log.New(logOutput, "", log.LstdFlags),
-		uiDir:    uiDir,
-	}
-	srv.registerHandlers(enableDebug)
-
-	// Start the server
-	go http.Serve(list, mux)
-	return srv, nil
+	tc.SetKeepAlive(true)
+	tc.SetKeepAlivePeriod(30 * time.Second)
+	return tc, nil
 }
 
 // Shutdown is used to shutdown the HTTP server
 func (s *HTTPServer) Shutdown() {
-	s.listener.Close()
+	if s != nil {
+		s.logger.Printf("[DEBUG] http: Shutting down http server (%v)", s.addr)
+		s.listener.Close()
+	}
 }
 
 // registerHandlers is used to attach our handlers to the mux
@@ -77,6 +210,7 @@ func (s *HTTPServer) registerHandlers(enableDebug bool) {
 	s.mux.HandleFunc("/v1/health/service/", s.wrap(s.HealthServiceNodes))
 
 	s.mux.HandleFunc("/v1/agent/self", s.wrap(s.AgentSelf))
+	s.mux.HandleFunc("/v1/agent/maintenance", s.wrap(s.AgentNodeMaintenance))
 	s.mux.HandleFunc("/v1/agent/services", s.wrap(s.AgentServices))
 	s.mux.HandleFunc("/v1/agent/checks", s.wrap(s.AgentChecks))
 	s.mux.HandleFunc("/v1/agent/members", s.wrap(s.AgentMembers))
@@ -91,14 +225,35 @@ func (s *HTTPServer) registerHandlers(enableDebug bool) {
 
 	s.mux.HandleFunc("/v1/agent/service/register", s.wrap(s.AgentRegisterService))
 	s.mux.HandleFunc("/v1/agent/service/deregister/", s.wrap(s.AgentDeregisterService))
+	s.mux.HandleFunc("/v1/agent/service/maintenance/", s.wrap(s.AgentServiceMaintenance))
+
+	s.mux.HandleFunc("/v1/event/fire/", s.wrap(s.EventFire))
+	s.mux.HandleFunc("/v1/event/list", s.wrap(s.EventList))
 
 	s.mux.HandleFunc("/v1/kv/", s.wrap(s.KVSEndpoint))
 
 	s.mux.HandleFunc("/v1/session/create", s.wrap(s.SessionCreate))
 	s.mux.HandleFunc("/v1/session/destroy/", s.wrap(s.SessionDestroy))
+	s.mux.HandleFunc("/v1/session/renew/", s.wrap(s.SessionRenew))
 	s.mux.HandleFunc("/v1/session/info/", s.wrap(s.SessionGet))
 	s.mux.HandleFunc("/v1/session/node/", s.wrap(s.SessionsForNode))
 	s.mux.HandleFunc("/v1/session/list", s.wrap(s.SessionList))
+
+	if s.agent.config.ACLDatacenter != "" {
+		s.mux.HandleFunc("/v1/acl/create", s.wrap(s.ACLCreate))
+		s.mux.HandleFunc("/v1/acl/update", s.wrap(s.ACLUpdate))
+		s.mux.HandleFunc("/v1/acl/destroy/", s.wrap(s.ACLDestroy))
+		s.mux.HandleFunc("/v1/acl/info/", s.wrap(s.ACLGet))
+		s.mux.HandleFunc("/v1/acl/clone/", s.wrap(s.ACLClone))
+		s.mux.HandleFunc("/v1/acl/list", s.wrap(s.ACLList))
+	} else {
+		s.mux.HandleFunc("/v1/acl/create", s.wrap(aclDisabled))
+		s.mux.HandleFunc("/v1/acl/update", s.wrap(aclDisabled))
+		s.mux.HandleFunc("/v1/acl/destroy/", s.wrap(aclDisabled))
+		s.mux.HandleFunc("/v1/acl/info/", s.wrap(aclDisabled))
+		s.mux.HandleFunc("/v1/acl/clone/", s.wrap(aclDisabled))
+		s.mux.HandleFunc("/v1/acl/list", s.wrap(aclDisabled))
+	}
 
 	if enableDebug {
 		s.mux.HandleFunc("/debug/pprof/", pprof.Index)
@@ -111,7 +266,10 @@ func (s *HTTPServer) registerHandlers(enableDebug bool) {
 	if s.uiDir != "" {
 		// Static file serving done from /ui/
 		s.mux.Handle("/ui/", http.StripPrefix("/ui/", http.FileServer(http.Dir(s.uiDir))))
+	}
 
+	// Enable the special endpoints for UI or SCADA
+	if s.uiDir != "" || s.agent.config.AtlasInfrastructure != "" {
 		// API's are under /internal/ui/ to avoid conflict
 		s.mux.HandleFunc("/v1/internal/ui/nodes", s.wrap(s.UINodes))
 		s.mux.HandleFunc("/v1/internal/ui/node/", s.wrap(s.UINodeInfo))
@@ -122,6 +280,8 @@ func (s *HTTPServer) registerHandlers(enableDebug bool) {
 // wrap is used to wrap functions to make them more convenient
 func (s *HTTPServer) wrap(handler func(resp http.ResponseWriter, req *http.Request) (interface{}, error)) func(resp http.ResponseWriter, req *http.Request) {
 	f := func(resp http.ResponseWriter, req *http.Request) {
+		setHeaders(resp, s.agent.config.HTTPAPIResponseHeaders)
+
 		// Invoke the handler
 		start := time.Now()
 		defer func() {
@@ -133,20 +293,33 @@ func (s *HTTPServer) wrap(handler func(resp http.ResponseWriter, req *http.Reque
 	HAS_ERR:
 		if err != nil {
 			s.logger.Printf("[ERR] http: Request %v, error: %v", req.URL, err)
-			resp.WriteHeader(500)
+			code := 500
+			errMsg := err.Error()
+			if strings.Contains(errMsg, "Permission denied") || strings.Contains(errMsg, "ACL not found") {
+				code = 403
+			}
+			resp.WriteHeader(code)
 			resp.Write([]byte(err.Error()))
 			return
 		}
 
+		prettyPrint := false
+		if _, ok := req.URL.Query()["pretty"]; ok {
+			prettyPrint = true
+		}
 		// Write out the JSON object
 		if obj != nil {
-			var buf bytes.Buffer
-			enc := json.NewEncoder(&buf)
-			if err = enc.Encode(obj); err != nil {
+			var buf []byte
+			if prettyPrint {
+				buf, err = json.MarshalIndent(obj, "", "    ")
+			} else {
+				buf, err = json.Marshal(obj)
+			}
+			if err != nil {
 				goto HAS_ERR
 			}
 			resp.Header().Set("Content-Type", "application/json")
-			resp.Write(buf.Bytes())
+			resp.Write(buf)
 		}
 	}
 	return f
@@ -189,7 +362,7 @@ func decodeBody(req *http.Request, out interface{}, cb func(interface{}) error) 
 
 // setIndex is used to set the index response header
 func setIndex(resp http.ResponseWriter, index uint64) {
-	resp.Header().Add("X-Consul-Index", strconv.FormatUint(index, 10))
+	resp.Header().Set("X-Consul-Index", strconv.FormatUint(index, 10))
 }
 
 // setKnownLeader is used to set the known leader header
@@ -198,13 +371,13 @@ func setKnownLeader(resp http.ResponseWriter, known bool) {
 	if !known {
 		s = "false"
 	}
-	resp.Header().Add("X-Consul-KnownLeader", s)
+	resp.Header().Set("X-Consul-KnownLeader", s)
 }
 
 // setLastContact is used to set the last contact header
 func setLastContact(resp http.ResponseWriter, last time.Duration) {
 	lastMsec := uint64(last / time.Millisecond)
-	resp.Header().Add("X-Consul-LastContact", strconv.FormatUint(lastMsec, 10))
+	resp.Header().Set("X-Consul-LastContact", strconv.FormatUint(lastMsec, 10))
 }
 
 // setMeta is used to set the query response meta data
@@ -212,6 +385,13 @@ func setMeta(resp http.ResponseWriter, m *structs.QueryMeta) {
 	setIndex(resp, m.Index)
 	setLastContact(resp, m.LastContact)
 	setKnownLeader(resp, m.KnownLeader)
+}
+
+// setHeaders is used to set canonical response header fields
+func setHeaders(resp http.ResponseWriter, headers map[string]string) {
+	for field, value := range headers {
+		resp.Header().Set(http.CanonicalHeaderKey(field), value)
+	}
 }
 
 // parseWait is used to parse the ?wait and ?index query params
@@ -266,10 +446,28 @@ func (s *HTTPServer) parseDC(req *http.Request, dc *string) {
 	}
 }
 
+// parseToken is used to parse the ?token query param
+func (s *HTTPServer) parseToken(req *http.Request, token *string) {
+	if other := req.URL.Query().Get("token"); other != "" {
+		*token = other
+		return
+	}
+
+	// Set the AtlasACLToken if SCADA
+	if s.addr == scadaHTTPAddr && s.agent.config.AtlasACLToken != "" {
+		*token = s.agent.config.AtlasACLToken
+		return
+	}
+
+	// Set the default ACLToken
+	*token = s.agent.config.ACLToken
+}
+
 // parse is a convenience method for endpoints that need
 // to use both parseWait and parseDC.
 func (s *HTTPServer) parse(resp http.ResponseWriter, req *http.Request, dc *string, b *structs.QueryOptions) bool {
 	s.parseDC(req, dc)
+	s.parseToken(req, &b.Token)
 	if parseConsistency(resp, req, b) {
 		return true
 	}

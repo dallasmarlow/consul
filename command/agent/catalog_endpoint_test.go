@@ -39,6 +39,17 @@ func TestCatalogRegister(t *testing.T) {
 	if res != true {
 		t.Fatalf("bad: %v", res)
 	}
+
+	// Service should be in sync
+	if err := srv.agent.state.syncService("foo"); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if _, ok := srv.agent.state.serviceStatus["foo"]; !ok {
+		t.Fatalf("bad: %#v", srv.agent.state.serviceStatus)
+	}
+	if !srv.agent.state.serviceStatus["foo"].inSync {
+		t.Fatalf("should be in sync")
+	}
 }
 
 func TestCatalogDeregister(t *testing.T) {
@@ -76,15 +87,20 @@ func TestCatalogDatacenters(t *testing.T) {
 	defer srv.Shutdown()
 	defer srv.agent.Shutdown()
 
-	obj, err := srv.CatalogDatacenters(nil, nil)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	testutil.WaitForResult(func() (bool, error) {
+		obj, err := srv.CatalogDatacenters(nil, nil)
+		if err != nil {
+			return false, err
+		}
 
-	dcs := obj.([]string)
-	if len(dcs) != 1 {
-		t.Fatalf("bad: %v", obj)
-	}
+		dcs := obj.([]string)
+		if len(dcs) != 1 {
+			return false, fmt.Errorf("missing dc: %v", dcs)
+		}
+		return true, nil
+	}, func(err error) {
+		t.Fatalf("bad: %v", err)
+	})
 }
 
 func TestCatalogNodes(t *testing.T) {

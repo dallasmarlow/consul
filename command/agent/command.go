@@ -3,36 +3,50 @@ package agent
 import (
 	"flag"
 	"fmt"
-	"github.com/armon/go-metrics"
-	"github.com/hashicorp/go-syslog"
-	"github.com/hashicorp/logutils"
-	"github.com/mitchellh/cli"
 	"io"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/armon/go-metrics"
+	"github.com/hashicorp/consul/watch"
+	"github.com/hashicorp/go-checkpoint"
+	"github.com/hashicorp/go-syslog"
+	"github.com/hashicorp/logutils"
+	scada "github.com/hashicorp/scada-client"
+	"github.com/mitchellh/cli"
 )
 
 // gracefulTimeout controls how long we wait before forcefully terminating
 var gracefulTimeout = 5 * time.Second
+
+// validDatacenter is used to validate a datacenter
+var validDatacenter = regexp.MustCompile("^[a-zA-Z0-9_-]+$")
 
 // Command is a Command implementation that runs a Consul agent.
 // The command will not end unless a shutdown message is sent on the
 // ShutdownCh. If two messages are sent on the ShutdownCh it will forcibly
 // exit.
 type Command struct {
-	Ui         cli.Ui
-	ShutdownCh <-chan struct{}
-	args       []string
-	logFilter  *logutils.LevelFilter
-	agent      *Agent
-	rpcServer  *AgentRPC
-	httpServer *HTTPServer
-	dnsServer  *DNSServer
+	Revision          string
+	Version           string
+	VersionPrerelease string
+	Ui                cli.Ui
+	ShutdownCh        <-chan struct{}
+	args              []string
+	logFilter         *logutils.LevelFilter
+	logOutput         io.Writer
+	agent             *Agent
+	rpcServer         *AgentRPC
+	httpServers       []*HTTPServer
+	dnsServer         *DNSServer
+	scadaProvider     *scada.Provider
 }
 
 // readConfig is responsible for setup of our configuration using
@@ -40,11 +54,15 @@ type Command struct {
 func (c *Command) readConfig() *Config {
 	var cmdConfig Config
 	var configFiles []string
+	var retryInterval string
+	var retryIntervalWan string
+	var dnsRecursors []string
 	cmdFlags := flag.NewFlagSet("agent", flag.ContinueOnError)
 	cmdFlags.Usage = func() { c.Ui.Output(c.Help()) }
 
 	cmdFlags.Var((*AppendSliceValue)(&configFiles), "config-file", "json file to read config from")
 	cmdFlags.Var((*AppendSliceValue)(&configFiles), "config-dir", "directory of json files to read")
+	cmdFlags.Var((*AppendSliceValue)(&dnsRecursors), "recursor", "address of an upstream DNS server")
 
 	cmdFlags.StringVar(&cmdConfig.LogLevel, "log-level", "", "log level")
 	cmdFlags.StringVar(&cmdConfig.NodeName, "node", "", "node name")
@@ -52,13 +70,19 @@ func (c *Command) readConfig() *Config {
 	cmdFlags.StringVar(&cmdConfig.DataDir, "data-dir", "", "path to the data directory")
 	cmdFlags.StringVar(&cmdConfig.UiDir, "ui-dir", "", "path to the web UI directory")
 	cmdFlags.StringVar(&cmdConfig.PidFile, "pid-file", "", "path to file to store PID")
+	cmdFlags.StringVar(&cmdConfig.EncryptKey, "encrypt", "", "gossip encryption key")
 
 	cmdFlags.BoolVar(&cmdConfig.Server, "server", false, "run agent as server")
 	cmdFlags.BoolVar(&cmdConfig.Bootstrap, "bootstrap", false, "enable server bootstrap mode")
+	cmdFlags.IntVar(&cmdConfig.BootstrapExpect, "bootstrap-expect", 0, "enable automatic bootstrap via expect mode")
 
-	cmdFlags.StringVar(&cmdConfig.ClientAddr, "client", "", "address to bind client listeners to (DNS, HTTP, RPC)")
+	cmdFlags.StringVar(&cmdConfig.ClientAddr, "client", "", "address to bind client listeners to (DNS, HTTP, HTTPS, RPC)")
 	cmdFlags.StringVar(&cmdConfig.BindAddr, "bind", "", "address to bind server listeners to")
 	cmdFlags.StringVar(&cmdConfig.AdvertiseAddr, "advertise", "", "address to advertise instead of bind addr")
+
+	cmdFlags.StringVar(&cmdConfig.AtlasInfrastructure, "atlas", "", "infrastructure name in Atlas")
+	cmdFlags.StringVar(&cmdConfig.AtlasToken, "atlas-token", "", "authentication token for Atlas")
+	cmdFlags.BoolVar(&cmdConfig.AtlasJoin, "atlas-join", false, "auto-join with Atlas")
 
 	cmdFlags.IntVar(&cmdConfig.Protocol, "protocol", -1, "protocol version")
 
@@ -68,9 +92,41 @@ func (c *Command) readConfig() *Config {
 		"enable re-joining after a previous leave")
 	cmdFlags.Var((*AppendSliceValue)(&cmdConfig.StartJoin), "join",
 		"address of agent to join on startup")
+	cmdFlags.Var((*AppendSliceValue)(&cmdConfig.StartJoinWan), "join-wan",
+		"address of agent to join -wan on startup")
+	cmdFlags.Var((*AppendSliceValue)(&cmdConfig.RetryJoin), "retry-join",
+		"address of agent to join on startup with retry")
+	cmdFlags.IntVar(&cmdConfig.RetryMaxAttempts, "retry-max", 0,
+		"number of retries for joining")
+	cmdFlags.StringVar(&retryInterval, "retry-interval", "",
+		"interval between join attempts")
+	cmdFlags.Var((*AppendSliceValue)(&cmdConfig.RetryJoinWan), "retry-join-wan",
+		"address of agent to join -wan on startup with retry")
+	cmdFlags.IntVar(&cmdConfig.RetryMaxAttemptsWan, "retry-max-wan", 0,
+		"number of retries for joining -wan")
+	cmdFlags.StringVar(&retryIntervalWan, "retry-interval-wan", "",
+		"interval between join -wan attempts")
 
 	if err := cmdFlags.Parse(c.args); err != nil {
 		return nil
+	}
+
+	if retryInterval != "" {
+		dur, err := time.ParseDuration(retryInterval)
+		if err != nil {
+			c.Ui.Error(fmt.Sprintf("Error: %s", err))
+			return nil
+		}
+		cmdConfig.RetryInterval = dur
+	}
+
+	if retryIntervalWan != "" {
+		dur, err := time.ParseDuration(retryIntervalWan)
+		if err != nil {
+			c.Ui.Error(fmt.Sprintf("Error: %s", err))
+			return nil
+		}
+		cmdConfig.RetryIntervalWan = dur
 	}
 
 	config := DefaultConfig()
@@ -84,6 +140,8 @@ func (c *Command) readConfig() *Config {
 		config = MergeConfig(config, fileConfig)
 	}
 
+	cmdConfig.DNSRecursors = append(cmdConfig.DNSRecursors, dnsRecursors...)
+
 	config = MergeConfig(config, &cmdConfig)
 
 	if config.NodeName == "" {
@@ -95,16 +153,32 @@ func (c *Command) readConfig() *Config {
 		config.NodeName = hostname
 	}
 
+	// Ensure we have a data directory
+	if config.DataDir == "" {
+		c.Ui.Error("Must specify data directory using -data-dir")
+		return nil
+	}
+
 	if config.EncryptKey != "" {
 		if _, err := config.EncryptBytes(); err != nil {
 			c.Ui.Error(fmt.Sprintf("Invalid encryption key: %s", err))
 			return nil
 		}
+		keyfileLAN := filepath.Join(config.DataDir, serfLANKeyring)
+		if _, err := os.Stat(keyfileLAN); err == nil {
+			c.Ui.Error("WARNING: LAN keyring exists but -encrypt given, using keyring")
+		}
+		if config.Server {
+			keyfileWAN := filepath.Join(config.DataDir, serfWANKeyring)
+			if _, err := os.Stat(keyfileWAN); err == nil {
+				c.Ui.Error("WARNING: WAN keyring exists but -encrypt given, using keyring")
+			}
+		}
 	}
 
-	// Ensure we have a data directory
-	if config.DataDir == "" {
-		c.Ui.Error("Must specify data directory using -data-dir")
+	// Verify datacenter is valid
+	if !validDatacenter.MatchString(config.Datacenter) {
+		c.Ui.Error("Datacenter must be alpha-numeric with underscores and hypens only")
 		return nil
 	}
 
@@ -112,6 +186,46 @@ func (c *Command) readConfig() *Config {
 	if config.Bootstrap && !config.Server {
 		c.Ui.Error("Bootstrap mode cannot be enabled when server mode is not enabled")
 		return nil
+	}
+
+	// Expect can only work when acting as a server
+	if config.BootstrapExpect != 0 && !config.Server {
+		c.Ui.Error("Expect mode cannot be enabled when server mode is not enabled")
+		return nil
+	}
+
+	// Expect & Bootstrap are mutually exclusive
+	if config.BootstrapExpect != 0 && config.Bootstrap {
+		c.Ui.Error("Bootstrap cannot be provided with an expected server count")
+		return nil
+	}
+
+	// Compile all the watches
+	for _, params := range config.Watches {
+		// Parse the watches, excluding the handler
+		wp, err := watch.ParseExempt(params, []string{"handler"})
+		if err != nil {
+			c.Ui.Error(fmt.Sprintf("Failed to parse watch (%#v): %v", params, err))
+			return nil
+		}
+
+		// Get the handler
+		if err := verifyWatchHandler(wp.Exempt["handler"]); err != nil {
+			c.Ui.Error(fmt.Sprintf("Failed to setup watch handler (%#v): %v", params, err))
+			return nil
+		}
+
+		// Store the watch plan
+		config.WatchPlans = append(config.WatchPlans, wp)
+	}
+
+	// Warn if we are in expect mode
+	if config.BootstrapExpect == 1 {
+		c.Ui.Error("WARNING: BootstrapExpect Mode is specified as 1; this is the same as Bootstrap mode.")
+		config.BootstrapExpect = 0
+		config.Bootstrap = true
+	} else if config.BootstrapExpect > 0 {
+		c.Ui.Error(fmt.Sprintf("WARNING: Expect Mode enabled, expecting %d servers", config.BootstrapExpect))
 	}
 
 	// Warn if we are in bootstrap mode
@@ -123,6 +237,11 @@ func (c *Command) readConfig() *Config {
 	if config.Server && runtime.GOOS == "windows" {
 		c.Ui.Error("WARNING: Windows is not recommended as a Consul server. Do not use in production.")
 	}
+
+	// Set the version info
+	config.Revision = c.Revision
+	config.Version = c.Version
+	config.VersionPrerelease = c.VersionPrerelease
 
 	return config
 }
@@ -149,12 +268,12 @@ func (c *Command) setupLoggers(config *Config) (*GatedWriter, *logWriter, io.Wri
 	// Check if syslog is enabled
 	var syslog io.Writer
 	if config.EnableSyslog {
-		l, err := gsyslog.NewLogger(gsyslog.LOG_NOTICE, "consul")
+		l, err := gsyslog.NewLogger(gsyslog.LOG_NOTICE, config.SyslogFacility, "consul")
 		if err != nil {
 			c.Ui.Error(fmt.Sprintf("Syslog setup failed: %v", err))
 			return nil, nil, nil
 		}
-		syslog = &SyslogWrapper{l}
+		syslog = &SyslogWrapper{l, c.logFilter}
 	}
 
 	// Create a log writer, and wrap a logOutput around it
@@ -165,6 +284,7 @@ func (c *Command) setupLoggers(config *Config) (*GatedWriter, *logWriter, io.Wri
 	} else {
 		logOutput = io.MultiWriter(c.logFilter, logWriter)
 	}
+	c.logOutput = logOutput
 	return logGate, logWriter, logOutput
 }
 
@@ -179,48 +299,77 @@ func (c *Command) setupAgent(config *Config, logOutput io.Writer, logWriter *log
 	c.agent = agent
 
 	// Setup the RPC listener
-	rpcAddr, err := config.ClientListener(config.Ports.RPC)
+	rpcAddr, err := config.ClientListener(config.Addresses.RPC, config.Ports.RPC)
 	if err != nil {
 		c.Ui.Error(fmt.Sprintf("Invalid RPC bind address: %s", err))
 		return err
 	}
 
-	rpcListener, err := net.Listen("tcp", rpcAddr.String())
+	// Clear the domain socket file if it exists
+	socketPath, isSocket := unixSocketAddr(config.Addresses.RPC)
+	if isSocket {
+		if _, err := os.Stat(socketPath); !os.IsNotExist(err) {
+			agent.logger.Printf("[WARN] agent: Replacing socket %q", socketPath)
+		}
+		if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
+			c.Ui.Output(fmt.Sprintf("Error removing socket file: %s", err))
+			return err
+		}
+	}
+
+	rpcListener, err := net.Listen(rpcAddr.Network(), rpcAddr.String())
 	if err != nil {
 		agent.Shutdown()
 		c.Ui.Error(fmt.Sprintf("Error starting RPC listener: %s", err))
 		return err
 	}
 
+	// Set up ownership/permission bits on the socket file
+	if isSocket {
+		if err := setFilePermissions(socketPath, config.UnixSockets); err != nil {
+			agent.Shutdown()
+			c.Ui.Error(fmt.Sprintf("Error setting up socket: %s", err))
+			return err
+		}
+	}
+
 	// Start the IPC layer
 	c.Ui.Output("Starting Consul agent RPC...")
 	c.rpcServer = NewAgentRPC(agent, rpcListener, logOutput, logWriter)
 
-	if config.Ports.HTTP > 0 {
-		httpAddr, err := config.ClientListener(config.Ports.HTTP)
-		if err != nil {
-			c.Ui.Error(fmt.Sprintf("Invalid HTTP bind address: %s", err))
-			return err
-		}
-
-		server, err := NewHTTPServer(agent, config.UiDir, config.EnableDebug, logOutput, httpAddr.String())
+	// Enable the SCADA integration
+	var scadaList net.Listener
+	if config.AtlasInfrastructure != "" {
+		provider, list, err := NewProvider(config, logOutput)
 		if err != nil {
 			agent.Shutdown()
-			c.Ui.Error(fmt.Sprintf("Error starting http server: %s", err))
+			c.Ui.Error(fmt.Sprintf("Error starting SCADA connection: %s", err))
 			return err
 		}
-		c.httpServer = server
+		c.scadaProvider = provider
+		scadaList = list
+	}
+
+	if config.Ports.HTTP > 0 || config.Ports.HTTPS > 0 || scadaList != nil {
+		servers, err := NewHTTPServers(agent, config, scadaList, logOutput)
+		if err != nil {
+			agent.Shutdown()
+			c.Ui.Error(fmt.Sprintf("Error starting http servers: %s", err))
+			return err
+		}
+		c.httpServers = servers
 	}
 
 	if config.Ports.DNS > 0 {
-		dnsAddr, err := config.ClientListener(config.Ports.DNS)
+		dnsAddr, err := config.ClientListener(config.Addresses.DNS, config.Ports.DNS)
 		if err != nil {
+			agent.Shutdown()
 			c.Ui.Error(fmt.Sprintf("Invalid DNS bind address: %s", err))
 			return err
 		}
 
-		server, err := NewDNSServer(agent, logOutput, config.Domain,
-			dnsAddr.String(), config.DNSRecursor)
+		server, err := NewDNSServer(agent, &config.DNSConfig, logOutput,
+			config.Domain, dnsAddr.String(), config.DNSRecursors)
 		if err != nil {
 			agent.Shutdown()
 			c.Ui.Error(fmt.Sprintf("Error starting dns server: %s", err))
@@ -229,7 +378,49 @@ func (c *Command) setupAgent(config *Config, logOutput io.Writer, logWriter *log
 		c.dnsServer = server
 	}
 
+	// Setup update checking
+	if !config.DisableUpdateCheck {
+		version := config.Version
+		if config.VersionPrerelease != "" {
+			version += fmt.Sprintf("-%s", config.VersionPrerelease)
+		}
+		updateParams := &checkpoint.CheckParams{
+			Product: "consul",
+			Version: version,
+		}
+		if !config.DisableAnonymousSignature {
+			updateParams.SignatureFile = filepath.Join(config.DataDir, "checkpoint-signature")
+		}
+
+		// Schedule a periodic check with expected interval of 24 hours
+		checkpoint.CheckInterval(updateParams, 24*time.Hour, c.checkpointResults)
+
+		// Do an immediate check within the next 30 seconds
+		go func() {
+			time.Sleep(randomStagger(30 * time.Second))
+			c.checkpointResults(checkpoint.Check(updateParams))
+		}()
+	}
 	return nil
+}
+
+// checkpointResults is used to handler periodic results from our update checker
+func (c *Command) checkpointResults(results *checkpoint.CheckResponse, err error) {
+	if err != nil {
+		c.Ui.Error(fmt.Sprintf("Failed to check for updates: %v", err))
+		return
+	}
+	if results.Outdated {
+		c.Ui.Error(fmt.Sprintf("Newer Consul version available: %s", results.CurrentVersion))
+	}
+	for _, alert := range results.Alerts {
+		switch alert.Level {
+		case "info":
+			c.Ui.Info(fmt.Sprintf("Bulletin [%s]: %s (%s)", alert.Level, alert.Message, alert.URL))
+		default:
+			c.Ui.Error(fmt.Sprintf("Bulletin [%s]: %s (%s)", alert.Level, alert.Message, alert.URL))
+		}
+	}
 }
 
 // startupJoin is invoked to handle any joins specified to take place at start time
@@ -248,6 +439,100 @@ func (c *Command) startupJoin(config *Config) error {
 	return nil
 }
 
+// startupJoinWan is invoked to handle any joins -wan specified to take place at start time
+func (c *Command) startupJoinWan(config *Config) error {
+	if len(config.StartJoinWan) == 0 {
+		return nil
+	}
+
+	c.Ui.Output("Joining -wan cluster...")
+	n, err := c.agent.JoinWAN(config.StartJoinWan)
+	if err != nil {
+		return err
+	}
+
+	c.Ui.Info(fmt.Sprintf("Join -wan completed. Synced with %d initial agents", n))
+	return nil
+}
+
+// retryJoin is used to handle retrying a join until it succeeds or all
+// retries are exhausted.
+func (c *Command) retryJoin(config *Config, errCh chan<- struct{}) {
+	if len(config.RetryJoin) == 0 {
+		return
+	}
+
+	logger := c.agent.logger
+	logger.Printf("[INFO] agent: Joining cluster...")
+
+	attempt := 0
+	for {
+		n, err := c.agent.JoinLAN(config.RetryJoin)
+		if err == nil {
+			logger.Printf("[INFO] agent: Join completed. Synced with %d initial agents", n)
+			return
+		}
+
+		attempt++
+		if config.RetryMaxAttempts > 0 && attempt > config.RetryMaxAttempts {
+			logger.Printf("[ERROR] agent: max join retry exhausted, exiting")
+			close(errCh)
+			return
+		}
+
+		logger.Printf("[WARN] agent: Join failed: %v, retrying in %v", err,
+			config.RetryInterval)
+		time.Sleep(config.RetryInterval)
+	}
+}
+
+// retryJoinWan is used to handle retrying a join -wan until it succeeds or all
+// retries are exhausted.
+func (c *Command) retryJoinWan(config *Config, errCh chan<- struct{}) {
+	if len(config.RetryJoinWan) == 0 {
+		return
+	}
+
+	logger := c.agent.logger
+	logger.Printf("[INFO] agent: Joining WAN cluster...")
+
+	attempt := 0
+	for {
+		n, err := c.agent.JoinWAN(config.RetryJoinWan)
+		if err == nil {
+			logger.Printf("[INFO] agent: Join -wan completed. Synced with %d initial agents", n)
+			return
+		}
+
+		attempt++
+		if config.RetryMaxAttemptsWan > 0 && attempt > config.RetryMaxAttemptsWan {
+			logger.Printf("[ERROR] agent: max join -wan retry exhausted, exiting")
+			close(errCh)
+			return
+		}
+
+		logger.Printf("[WARN] agent: Join -wan failed: %v, retrying in %v", err,
+			config.RetryIntervalWan)
+		time.Sleep(config.RetryIntervalWan)
+	}
+}
+
+// gossipEncrypted determines if the consul instance is using symmetric
+// encryption keys to protect gossip protocol messages.
+func (c *Command) gossipEncrypted() bool {
+	if c.agent.config.EncryptKey != "" {
+		return true
+	}
+
+	server := c.agent.server
+	if server != nil {
+		return server.KeyManagerLAN() != nil || server.KeyManagerWAN() != nil
+	}
+
+	client := c.agent.client
+	return client != nil && client.KeyManagerLAN() != nil
+}
+
 func (c *Command) Run(args []string) int {
 	c.Ui = &cli.PrefixedUi{
 		OutputPrefix: "==> ",
@@ -262,7 +547,6 @@ func (c *Command) Run(args []string) int {
 	if config == nil {
 		return 1
 	}
-	c.args = args
 
 	// Check GOMAXPROCS
 	if runtime.GOMAXPROCS(0) == 1 {
@@ -283,16 +567,31 @@ func (c *Command) Run(args []string) int {
 	metrics.DefaultInmemSignal(inm)
 	metricsConf := metrics.DefaultConfig("consul")
 
-	// Optionally configure a statsite sink if provided
+	// Configure the statsite sink
+	var fanout metrics.FanoutSink
 	if config.StatsiteAddr != "" {
 		sink, err := metrics.NewStatsiteSink(config.StatsiteAddr)
 		if err != nil {
 			c.Ui.Error(fmt.Sprintf("Failed to start statsite sink. Got: %s", err))
 			return 1
 		}
-		fanout := metrics.FanoutSink{inm, sink}
-		metrics.NewGlobal(metricsConf, fanout)
+		fanout = append(fanout, sink)
+	}
 
+	// Configure the statsd sink
+	if config.StatsdAddr != "" {
+		sink, err := metrics.NewStatsdSink(config.StatsdAddr)
+		if err != nil {
+			c.Ui.Error(fmt.Sprintf("Failed to start statsd sink. Got: %s", err))
+			return 1
+		}
+		fanout = append(fanout, sink)
+	}
+
+	// Initialize the global sink
+	if len(fanout) > 0 {
+		fanout = append(fanout, inm)
+		metrics.NewGlobal(metricsConf, fanout)
 	} else {
 		metricsConf.EnableHostname = false
 		metrics.NewGlobal(metricsConf, inm)
@@ -306,8 +605,14 @@ func (c *Command) Run(args []string) int {
 	if c.rpcServer != nil {
 		defer c.rpcServer.Shutdown()
 	}
-	if c.httpServer != nil {
-		defer c.httpServer.Shutdown()
+	if c.dnsServer != nil {
+		defer c.dnsServer.Shutdown()
+	}
+	for _, server := range c.httpServers {
+		defer server.Shutdown()
+	}
+	if c.scadaProvider != nil {
+		defer c.scadaProvider.Shutdown()
 	}
 
 	// Join startup nodes if specified
@@ -316,24 +621,41 @@ func (c *Command) Run(args []string) int {
 		return 1
 	}
 
-	// Register the services
-	for _, service := range config.Services {
-		ns := service.NodeService()
-		chkType := service.CheckType()
-		if err := c.agent.AddService(ns, chkType); err != nil {
-			c.Ui.Error(fmt.Sprintf("Failed to register service '%s': %v", service.Name, err))
-			return 1
-		}
+	// Join startup nodes if specified
+	if err := c.startupJoinWan(config); err != nil {
+		c.Ui.Error(err.Error())
+		return 1
 	}
 
-	// Register the checks
-	for _, check := range config.Checks {
-		health := check.HealthCheck(config.NodeName)
-		chkType := &check.CheckType
-		if err := c.agent.AddCheck(health, chkType); err != nil {
-			c.Ui.Error(fmt.Sprintf("Failed to register check '%s': %v %v", check.Name, err, check))
-			return 1
-		}
+	// Get the new client http listener addr
+	httpAddr, err := config.ClientListener(config.Addresses.HTTP, config.Ports.HTTP)
+	if err != nil {
+		c.Ui.Error(fmt.Sprintf("Failed to determine HTTP address: %v", err))
+	}
+
+	// Register the watches
+	for _, wp := range config.WatchPlans {
+		go func(wp *watch.WatchPlan) {
+			wp.Handler = makeWatchHandler(logOutput, wp.Exempt["handler"])
+			wp.LogOutput = c.logOutput
+			if err := wp.Run(httpAddr.String()); err != nil {
+				c.Ui.Error(fmt.Sprintf("Error running watch: %v", err))
+			}
+		}(wp)
+	}
+
+	// Figure out if gossip is encrypted
+	var gossipEncrypted bool
+	if config.Server {
+		gossipEncrypted = c.agent.server.Encrypted()
+	} else {
+		gossipEncrypted = c.agent.client.Encrypted()
+	}
+
+	// Determine the Atlas cluster
+	atlas := "<disabled>"
+	if config.AtlasInfrastructure != "" {
+		atlas = fmt.Sprintf("(Infrastructure: '%s' Join: %v)", config.AtlasInfrastructure, config.AtlasJoin)
 	}
 
 	// Let the agent know we've finished registration
@@ -343,24 +665,33 @@ func (c *Command) Run(args []string) int {
 	c.Ui.Info(fmt.Sprintf("     Node name: '%s'", config.NodeName))
 	c.Ui.Info(fmt.Sprintf("    Datacenter: '%s'", config.Datacenter))
 	c.Ui.Info(fmt.Sprintf("        Server: %v (bootstrap: %v)", config.Server, config.Bootstrap))
-	c.Ui.Info(fmt.Sprintf("   Client Addr: %v (HTTP: %d, DNS: %d, RPC: %d)", config.ClientAddr,
-		config.Ports.HTTP, config.Ports.DNS, config.Ports.RPC))
+	c.Ui.Info(fmt.Sprintf("   Client Addr: %v (HTTP: %d, HTTPS: %d, DNS: %d, RPC: %d)", config.ClientAddr,
+		config.Ports.HTTP, config.Ports.HTTPS, config.Ports.DNS, config.Ports.RPC))
 	c.Ui.Info(fmt.Sprintf("  Cluster Addr: %v (LAN: %d, WAN: %d)", config.AdvertiseAddr,
 		config.Ports.SerfLan, config.Ports.SerfWan))
 	c.Ui.Info(fmt.Sprintf("Gossip encrypt: %v, RPC-TLS: %v, TLS-Incoming: %v",
-		config.EncryptKey != "", config.VerifyOutgoing, config.VerifyIncoming))
+		gossipEncrypted, config.VerifyOutgoing, config.VerifyIncoming))
+	c.Ui.Info(fmt.Sprintf("         Atlas: %s", atlas))
 
 	// Enable log streaming
 	c.Ui.Info("")
 	c.Ui.Output("Log data will now stream in as it occurs:\n")
 	logGate.Flush()
 
+	// Start retry join process
+	errCh := make(chan struct{})
+	go c.retryJoin(config, errCh)
+
+	// Start retry -wan join process
+	errWanCh := make(chan struct{})
+	go c.retryJoinWan(config, errWanCh)
+
 	// Wait for exit
-	return c.handleSignals(config)
+	return c.handleSignals(config, errCh, errWanCh)
 }
 
 // handleSignals blocks until we get an exit-causing signal
-func (c *Command) handleSignals(config *Config) int {
+func (c *Command) handleSignals(config *Config, retryJoin <-chan struct{}, retryJoinWan <-chan struct{}) int {
 	signalCh := make(chan os.Signal, 4)
 	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 
@@ -370,8 +701,14 @@ WAIT:
 	select {
 	case s := <-signalCh:
 		sig = s
+	case <-c.rpcServer.ReloadCh():
+		sig = syscall.SIGHUP
 	case <-c.ShutdownCh:
 		sig = os.Interrupt
+	case <-retryJoin:
+		return 1
+	case <-retryJoinWan:
+		return 1
 	case <-c.agent.ShutdownCh():
 		// Agent is already shutdown!
 		return 0
@@ -445,34 +782,51 @@ func (c *Command) handleReload(config *Config) *Config {
 	c.agent.PauseSync()
 	defer c.agent.ResumeSync()
 
-	// Deregister the old services
-	for _, service := range config.Services {
-		ns := service.NodeService()
-		c.agent.RemoveService(ns.ID)
+	// Snapshot the current state, and restore it afterwards
+	snap := c.agent.snapshotCheckState()
+	defer c.agent.restoreCheckState(snap)
+
+	// First unload all checks and services. This lets us begin the reload
+	// with a clean slate.
+	if err := c.agent.unloadServices(); err != nil {
+		c.Ui.Error(fmt.Sprintf("Failed unloading services: %s", err))
+		return nil
+	}
+	if err := c.agent.unloadChecks(); err != nil {
+		c.Ui.Error(fmt.Sprintf("Failed unloading checks: %s", err))
+		return nil
 	}
 
-	// Deregister the old checks
-	for _, check := range config.Checks {
-		health := check.HealthCheck(config.NodeName)
-		c.agent.RemoveCheck(health.CheckID)
+	// Reload services and check definitions.
+	if err := c.agent.loadServices(newConf); err != nil {
+		c.Ui.Error(fmt.Sprintf("Failed reloading services: %s", err))
+		return nil
+	}
+	if err := c.agent.loadChecks(newConf); err != nil {
+		c.Ui.Error(fmt.Sprintf("Failed reloading checks: %s", err))
+		return nil
 	}
 
-	// Register the services
-	for _, service := range newConf.Services {
-		ns := service.NodeService()
-		chkType := service.CheckType()
-		if err := c.agent.AddService(ns, chkType); err != nil {
-			c.Ui.Error(fmt.Sprintf("Failed to register service '%s': %v", service.Name, err))
-		}
+	// Get the new client listener addr
+	httpAddr, err := newConf.ClientListener(config.Addresses.HTTP, config.Ports.HTTP)
+	if err != nil {
+		c.Ui.Error(fmt.Sprintf("Failed to determine HTTP address: %v", err))
 	}
 
-	// Register the checks
-	for _, check := range newConf.Checks {
-		health := check.HealthCheck(config.NodeName)
-		chkType := &check.CheckType
-		if err := c.agent.AddCheck(health, chkType); err != nil {
-			c.Ui.Error(fmt.Sprintf("Failed to register check '%s': %v %v", check.Name, err, check))
-		}
+	// Deregister the old watches
+	for _, wp := range config.WatchPlans {
+		wp.Stop()
+	}
+
+	// Register the new watches
+	for _, wp := range newConf.WatchPlans {
+		go func(wp *watch.WatchPlan) {
+			wp.Handler = makeWatchHandler(c.logOutput, wp.Exempt["handler"])
+			wp.LogOutput = c.logOutput
+			if err := wp.Run(httpAddr.String()); err != nil {
+				c.Ui.Error(fmt.Sprintf("Error running watch: %v", err))
+			}
+		}(wp)
 	}
 
 	return newConf
@@ -492,10 +846,14 @@ Usage: consul agent [options]
 Options:
 
   -advertise=addr          Sets the advertise address to use
+  -atlas=org/name          Sets the Atlas infrastructure name, enables SCADA.
+  -atlas-join              Enables auto-joining the Atlas cluster
+  -atlas-token=token       Provides the Atlas API token
   -bootstrap               Sets server to bootstrap mode
   -bind=0.0.0.0            Sets the bind address for cluster communication
+  -bootstrap-expect=0      Sets server to expect bootstrap mode.
   -client=127.0.0.1        Sets the address to bind for client access.
-                           This includes RPC, DNS and HTTP
+                           This includes RPC, DNS, HTTP and HTTPS (if configured)
   -config-file=foo         Path to a JSON file to read configuration from.
                            This can be specified multiple times.
   -config-dir=foo          Path to a directory to read configuration files
@@ -503,9 +861,24 @@ Options:
                            as configuration in this directory in alphabetical
                            order.
   -data-dir=path           Path to a data directory to store agent state
+  -recursor=1.2.3.4        Address of an upstream DNS server.
+                           Can be specified multiple times.
   -dc=east-aws             Datacenter of the agent
+  -encrypt=key             Provides the gossip encryption key
   -join=1.2.3.4            Address of an agent to join at start time.
                            Can be specified multiple times.
+  -join-wan=1.2.3.4        Address of an agent to join -wan at start time.
+                           Can be specified multiple times.
+  -retry-join=1.2.3.4      Address of an agent to join at start time with
+                           retries enabled. Can be specified multiple times.
+  -retry-interval=30s      Time to wait between join attempts.
+  -retry-max=0             Maximum number of join attempts. Defaults to 0, which
+                           will retry indefinitely.
+  -retry-join-wan=1.2.3.4  Address of an agent to join -wan at start time with
+                           retries enabled. Can be specified multiple times.
+  -retry-interval-wan=30s  Time to wait between join -wan attempts.
+  -retry-max-wan=0         Maximum number of join -wan attempts. Defaults to 0, which
+                           will retry indefinitely.
   -log-level=info          Log level of the agent.
   -node=hostname           Name of this node. Must be unique in the cluster
   -protocol=N              Sets the protocol version. Defaults to latest.

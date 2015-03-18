@@ -3,10 +3,12 @@ package agent
 import (
 	"bufio"
 	"fmt"
+	"github.com/hashicorp/go-msgpack/codec"
 	"github.com/hashicorp/logutils"
-	"github.com/ugorji/go/codec"
 	"log"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -34,7 +36,7 @@ type seqHandler interface {
 type RPCClient struct {
 	seq uint64
 
-	conn      *net.TCPConn
+	conn      net.Conn
 	reader    *bufio.Reader
 	writer    *bufio.Writer
 	dec       *codec.Decoder
@@ -79,25 +81,33 @@ func (c *RPCClient) send(header *requestHeader, obj interface{}) error {
 // NewRPCClient is used to create a new RPC client given the address.
 // This will properly dial, handshake, and start listening
 func NewRPCClient(addr string) (*RPCClient, error) {
+	var conn net.Conn
+	var err error
+
+	if envAddr := os.Getenv("CONSUL_RPC_ADDR"); envAddr != "" {
+		addr = envAddr
+	}
+
 	// Try to dial to agent
-	conn, err := net.Dial("tcp", addr)
-	if err != nil {
+	mode := "tcp"
+	if strings.HasPrefix(addr, "/") {
+		mode = "unix"
+	}
+	if conn, err = net.Dial(mode, addr); err != nil {
 		return nil, err
 	}
 
 	// Create the client
 	client := &RPCClient{
 		seq:        0,
-		conn:       conn.(*net.TCPConn),
+		conn:       conn,
 		reader:     bufio.NewReader(conn),
 		writer:     bufio.NewWriter(conn),
 		dispatch:   make(map[uint64]seqHandler),
 		shutdownCh: make(chan struct{}),
 	}
-	client.dec = codec.NewDecoder(client.reader,
-		&codec.MsgpackHandle{RawToString: true, WriteExt: true})
-	client.enc = codec.NewEncoder(client.writer,
-		&codec.MsgpackHandle{RawToString: true, WriteExt: true})
+	client.dec = codec.NewDecoder(client.reader, msgpackHandle)
+	client.enc = codec.NewEncoder(client.writer, msgpackHandle)
 	go client.listen()
 
 	// Do the initial handshake
@@ -178,6 +188,49 @@ func (c *RPCClient) WANMembers() ([]Member, error) {
 	return resp.Members, err
 }
 
+func (c *RPCClient) ListKeys() (keyringResponse, error) {
+	header := requestHeader{
+		Command: listKeysCommand,
+		Seq:     c.getSeq(),
+	}
+	var resp keyringResponse
+	err := c.genericRPC(&header, nil, &resp)
+	return resp, err
+}
+
+func (c *RPCClient) InstallKey(key string) (keyringResponse, error) {
+	header := requestHeader{
+		Command: installKeyCommand,
+		Seq:     c.getSeq(),
+	}
+	req := keyringRequest{key}
+	var resp keyringResponse
+	err := c.genericRPC(&header, &req, &resp)
+	return resp, err
+}
+
+func (c *RPCClient) UseKey(key string) (keyringResponse, error) {
+	header := requestHeader{
+		Command: useKeyCommand,
+		Seq:     c.getSeq(),
+	}
+	req := keyringRequest{key}
+	var resp keyringResponse
+	err := c.genericRPC(&header, &req, &resp)
+	return resp, err
+}
+
+func (c *RPCClient) RemoveKey(key string) (keyringResponse, error) {
+	header := requestHeader{
+		Command: removeKeyCommand,
+		Seq:     c.getSeq(),
+	}
+	req := keyringRequest{key}
+	var resp keyringResponse
+	err := c.genericRPC(&header, &req, &resp)
+	return resp, err
+}
+
 // Leave is used to trigger a graceful leave and shutdown
 func (c *RPCClient) Leave() error {
 	header := requestHeader{
@@ -197,6 +250,15 @@ func (c *RPCClient) Stats() (map[string]map[string]string, error) {
 
 	err := c.genericRPC(&header, nil, &resp)
 	return resp, err
+}
+
+// Reload is used to trigger a configuration reload
+func (c *RPCClient) Reload() error {
+	header := requestHeader{
+		Command: reloadCommand,
+		Seq:     c.getSeq(),
+	}
+	return c.genericRPC(&header, nil, nil)
 }
 
 type monitorHandler struct {

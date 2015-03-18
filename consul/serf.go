@@ -1,15 +1,35 @@
 package consul
 
 import (
-	"github.com/hashicorp/serf/serf"
+	"net"
 	"strings"
+
+	"github.com/hashicorp/serf/serf"
 )
 
 const (
 	// StatusReap is used to update the status of a node if we
 	// are handling a EventMemberReap
 	StatusReap = serf.MemberStatus(-1)
+
+	// userEventPrefix is pre-pended to a user event to distinguish it
+	userEventPrefix = "consul:event:"
 )
+
+// userEventName computes the name of a user event
+func userEventName(name string) string {
+	return userEventPrefix + name
+}
+
+// isUserEvent checks if a serf event is a user event
+func isUserEvent(name string) bool {
+	return strings.HasPrefix(name, userEventPrefix)
+}
+
+// rawUserEventName is used to get the raw user event name
+func rawUserEventName(name string) string {
+	return strings.TrimPrefix(name, userEventPrefix)
+}
 
 // lanEventHandler is used to handle events from the lan Serf cluster
 func (s *Server) lanEventHandler() {
@@ -100,13 +120,21 @@ func (s *Server) localEvent(event serf.UserEvent) {
 		return
 	}
 
-	switch event.Name {
-	case newLeaderEvent:
+	switch name := event.Name; {
+	case name == newLeaderEvent:
 		s.logger.Printf("[INFO] consul: New leader elected: %s", event.Payload)
 
 		// Trigger the callback
 		if s.config.ServerUp != nil {
 			s.config.ServerUp()
+		}
+	case isUserEvent(name):
+		event.Name = rawUserEventName(name)
+		s.logger.Printf("[DEBUG] consul: user event: %s", event.Name)
+
+		// Trigger the callback
+		if s.config.UserEventHandler != nil {
+			s.config.UserEventHandler(event)
 		}
 	default:
 		s.logger.Printf("[WARN] consul: Unhandled local event: %v", event)
@@ -119,7 +147,7 @@ func (s *Server) nodeJoin(me serf.MemberEvent, wan bool) {
 		ok, parts := isConsulServer(m)
 		if !ok {
 			if wan {
-				s.logger.Printf("[WARN] consul: non-server in WAN pool: %s %s", m.Name)
+				s.logger.Printf("[WARN] consul: non-server in WAN pool: %s", m.Name)
 			}
 			continue
 		}
@@ -144,12 +172,70 @@ func (s *Server) nodeJoin(me serf.MemberEvent, wan bool) {
 		s.remoteLock.Unlock()
 
 		// Add to the local list as well
-		if !wan {
+		if !wan && parts.Datacenter == s.config.Datacenter {
 			s.localLock.Lock()
 			s.localConsuls[parts.Addr.String()] = parts
 			s.localLock.Unlock()
 		}
+
+		// If we still expecting to bootstrap, may need to handle this
+		if s.config.BootstrapExpect != 0 {
+			s.maybeBootstrap()
+		}
 	}
+}
+
+// maybeBootsrap is used to handle bootstrapping when a new consul server joins
+func (s *Server) maybeBootstrap() {
+	index, err := s.raftStore.LastIndex()
+	if err != nil {
+		s.logger.Printf("[ERR] consul: failed to read last raft index: %v", err)
+		return
+	}
+
+	// Bootstrap can only be done if there are no committed logs,
+	// remove our expectations of bootstrapping
+	if index != 0 {
+		s.config.BootstrapExpect = 0
+		return
+	}
+
+	// Scan for all the known servers
+	members := s.serfLAN.Members()
+	addrs := make([]net.Addr, 0)
+	for _, member := range members {
+		valid, p := isConsulServer(member)
+		if !valid {
+			continue
+		}
+		if p.Datacenter != s.config.Datacenter {
+			s.logger.Printf("[ERR] consul: Member %v has a conflicting datacenter, ignoring", member)
+			continue
+		}
+		if p.Expect != 0 && p.Expect != s.config.BootstrapExpect {
+			s.logger.Printf("[ERR] consul: Member %v has a conflicting expect value. All nodes should expect the same number.", member)
+			return
+		}
+		if p.Bootstrap {
+			s.logger.Printf("[ERR] consul: Member %v has bootstrap mode. Expect disabled.", member)
+			return
+		}
+		addrs = append(addrs, &net.TCPAddr{IP: member.Addr, Port: p.Port})
+	}
+
+	// Skip if we haven't met the minimum expect count
+	if len(addrs) < s.config.BootstrapExpect {
+		return
+	}
+
+	// Update the peer set
+	s.logger.Printf("[INFO] consul: Attempting bootstrap with nodes: %v", addrs)
+	if err := s.raft.SetPeers(addrs).Error(); err != nil {
+		s.logger.Printf("[ERR] consul: failed to bootstrap peers: %v", err)
+	}
+
+	// Bootstrapping comlete, don't enter this again
+	s.config.BootstrapExpect = 0
 }
 
 // nodeFailed is used to handle fail events on both the serf clustes

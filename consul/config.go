@@ -1,15 +1,13 @@
 package consul
 
 import (
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"os"
 	"time"
 
+	"github.com/hashicorp/consul/tlsutil"
 	"github.com/hashicorp/memberlist"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/serf/serf"
@@ -43,6 +41,11 @@ type Config struct {
 	// It is required so that it can elect a leader without any
 	// other nodes being present
 	Bootstrap bool
+
+	// BootstrapExpect mode is used to automatically bring up a collection of
+	// Consul servers. This can be used to automatically bring up a collection
+	// of nodes.
+	BootstrapExpect int
 
 	// Datacenter is the datacenter this Consul server represents
 	Datacenter string
@@ -109,15 +112,82 @@ type Config struct {
 	// Must be provided to serve TLS connections.
 	KeyFile string
 
+	// ServerName is used with the TLS certificate to ensure the name we
+	// provide matches the certificate
+	ServerName string
+
 	// RejoinAfterLeave controls our interaction with Serf.
 	// When set to false (default), a leave causes a Consul to not rejoin
 	// the cluster until an explicit join is received. If this is set to
 	// true, we ignore the leave, and rejoin the cluster on start.
 	RejoinAfterLeave bool
 
+	// Build is a string that is gossiped around, and can be used to help
+	// operators track which versions are actively deployed
+	Build string
+
+	// ACLToken is the default token to use when making a request.
+	// If not provided, the anonymous token is used. This enables
+	// backwards compatibility as well.
+	ACLToken string
+
+	// ACLMasterToken is used to bootstrap the ACL system. It should be specified
+	// on the servers in the ACLDatacenter. When the leader comes online, it ensures
+	// that the Master token is available. This provides the initial token.
+	ACLMasterToken string
+
+	// ACLDatacenter provides the authoritative datacenter for ACL
+	// tokens. If not provided, ACL verification is disabled.
+	ACLDatacenter string
+
+	// ACLTTL controls the time-to-live of cached ACL policies.
+	// It can be set to zero to disable caching, but this adds
+	// a substantial cost.
+	ACLTTL time.Duration
+
+	// ACLDefaultPolicy is used to control the ACL interaction when
+	// there is no defined policy. This can be "allow" which means
+	// ACLs are used to black-list, or "deny" which means ACLs are
+	// white-lists.
+	ACLDefaultPolicy string
+
+	// ACLDownPolicy controls the behavior of ACLs if the ACLDatacenter
+	// cannot be contacted. It can be either "deny" to deny all requests,
+	// or "extend-cache" which ignores the ACLCacheInterval and uses
+	// cached policies. If a policy is not in the cache, it acts like deny.
+	// "allow" can be used to allow all requests. This is not recommended.
+	ACLDownPolicy string
+
+	// TombstoneTTL is used to control how long KV tombstones are retained.
+	// This provides a window of time where the X-Consul-Index is monotonic.
+	// Outside this window, the index may not be monotonic. This is a result
+	// of a few trade offs:
+	// 1) The index is defined by the data view and not globally. This is a
+	// performance optimization that prevents any write from incrementing the
+	// index for all data views.
+	// 2) Tombstones are not kept indefinitely, since otherwise storage required
+	// is also monotonic. This prevents deletes from reducing the disk space
+	// used.
+	// In theory, neither of these are intrinsic limitations, however for the
+	// purposes of building a practical system, they are reaonable trade offs.
+	//
+	// It is also possible to set this to an incredibly long time, thereby
+	// simulating infinite retention. This is not recommended however.
+	//
+	TombstoneTTL time.Duration
+
+	// TombstoneTTLGranularity is used to control how granular the timers are
+	// for the Tombstone GC. This is used to batch the GC of many keys together
+	// to reduce overhead. It is unlikely a user would ever need to tune this.
+	TombstoneTTLGranularity time.Duration
+
 	// ServerUp callback can be used to trigger a notification that
 	// a Consul server is now up and known about.
 	ServerUp func()
+
+	// UserEventHandler callback can be used to handle incoming
+	// user events. This function should not block.
+	UserEventHandler func(serf.UserEvent)
 }
 
 // CheckVersion is used to check if the ProtocolVersion is valid
@@ -132,103 +202,22 @@ func (c *Config) CheckVersion() error {
 	return nil
 }
 
-// AppendCA opens and parses the CA file and adds the certificates to
-// the provided CertPool.
-func (c *Config) AppendCA(pool *x509.CertPool) error {
-	if c.CAFile == "" {
-		return nil
+// CheckACL is used to sanity check the ACL configuration
+func (c *Config) CheckACL() error {
+	switch c.ACLDefaultPolicy {
+	case "allow":
+	case "deny":
+	default:
+		return fmt.Errorf("Unsupported default ACL policy: %s", c.ACLDefaultPolicy)
 	}
-
-	// Read the file
-	data, err := ioutil.ReadFile(c.CAFile)
-	if err != nil {
-		return fmt.Errorf("Failed to read CA file: %v", err)
+	switch c.ACLDownPolicy {
+	case "allow":
+	case "deny":
+	case "extend-cache":
+	default:
+		return fmt.Errorf("Unsupported down ACL policy: %s", c.ACLDownPolicy)
 	}
-
-	if !pool.AppendCertsFromPEM(data) {
-		return fmt.Errorf("Failed to parse any CA certificates")
-	}
-
 	return nil
-}
-
-// KeyPair is used to open and parse a certificate and key file
-func (c *Config) KeyPair() (*tls.Certificate, error) {
-	if c.CertFile == "" || c.KeyFile == "" {
-		return nil, nil
-	}
-	cert, err := tls.LoadX509KeyPair(c.CertFile, c.KeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("Failed to load cert/key pair: %v", err)
-	}
-	return &cert, err
-}
-
-// OutgoingTLSConfig generates a TLS configuration for outgoing requests
-func (c *Config) OutgoingTLSConfig() (*tls.Config, error) {
-	// Create the tlsConfig
-	tlsConfig := &tls.Config{
-		ServerName:         c.NodeName,
-		RootCAs:            x509.NewCertPool(),
-		InsecureSkipVerify: !c.VerifyOutgoing,
-	}
-
-	// Ensure we have a CA if VerifyOutgoing is set
-	if c.VerifyOutgoing && c.CAFile == "" {
-		return nil, fmt.Errorf("VerifyOutgoing set, and no CA certificate provided!")
-	}
-
-	// Parse the CA cert if any
-	err := c.AppendCA(tlsConfig.RootCAs)
-	if err != nil {
-		return nil, err
-	}
-
-	// Add cert/key
-	cert, err := c.KeyPair()
-	if err != nil {
-		return nil, err
-	} else if cert != nil {
-		tlsConfig.Certificates = []tls.Certificate{*cert}
-	}
-
-	return tlsConfig, nil
-}
-
-// IncomingTLSConfig generates a TLS configuration for incoming requests
-func (c *Config) IncomingTLSConfig() (*tls.Config, error) {
-	// Create the tlsConfig
-	tlsConfig := &tls.Config{
-		ServerName: c.NodeName,
-		ClientCAs:  x509.NewCertPool(),
-		ClientAuth: tls.NoClientCert,
-	}
-
-	// Parse the CA cert if any
-	err := c.AppendCA(tlsConfig.ClientCAs)
-	if err != nil {
-		return nil, err
-	}
-
-	// Add cert/key
-	cert, err := c.KeyPair()
-	if err != nil {
-		return nil, err
-	} else if cert != nil {
-		tlsConfig.Certificates = []tls.Certificate{*cert}
-	}
-
-	// Check if we require verification
-	if c.VerifyIncoming {
-		tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
-		if c.CAFile == "" {
-			return nil, fmt.Errorf("VerifyIncoming set, and no CA certificate provided!")
-		}
-		if cert == nil {
-			return nil, fmt.Errorf("VerifyIncoming set, and no Cert/Key pair provided!")
-		}
-	}
-	return tlsConfig, nil
 }
 
 // DefaultConfig is used to return a sane default configuration
@@ -239,14 +228,19 @@ func DefaultConfig() *Config {
 	}
 
 	conf := &Config{
-		Datacenter:        DefaultDC,
-		NodeName:          hostname,
-		RPCAddr:           DefaultRPCAddr,
-		RaftConfig:        raft.DefaultConfig(),
-		SerfLANConfig:     serf.DefaultConfig(),
-		SerfWANConfig:     serf.DefaultConfig(),
-		ReconcileInterval: 60 * time.Second,
-		ProtocolVersion:   ProtocolVersionMax,
+		Datacenter:              DefaultDC,
+		NodeName:                hostname,
+		RPCAddr:                 DefaultRPCAddr,
+		RaftConfig:              raft.DefaultConfig(),
+		SerfLANConfig:           serf.DefaultConfig(),
+		SerfWANConfig:           serf.DefaultConfig(),
+		ReconcileInterval:       60 * time.Second,
+		ProtocolVersion:         ProtocolVersionMax,
+		ACLTTL:                  30 * time.Second,
+		ACLDefaultPolicy:        "allow",
+		ACLDownPolicy:           "extend-cache",
+		TombstoneTTL:            15 * time.Minute,
+		TombstoneTTLGranularity: 30 * time.Second,
 	}
 
 	// Increase our reap interval to 3 days instead of 24h.
@@ -265,4 +259,17 @@ func DefaultConfig() *Config {
 	conf.RaftConfig.ShutdownOnRemove = false
 
 	return conf
+}
+
+func (c *Config) tlsConfig() *tlsutil.Config {
+	tlsConf := &tlsutil.Config{
+		VerifyIncoming: c.VerifyIncoming,
+		VerifyOutgoing: c.VerifyOutgoing,
+		CAFile:         c.CAFile,
+		CertFile:       c.CertFile,
+		KeyFile:        c.KeyFile,
+		NodeName:       c.NodeName,
+		ServerName:     c.ServerName}
+
+	return tlsConf
 }

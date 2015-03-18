@@ -1,21 +1,26 @@
 package consul
 
 import (
+	"fmt"
+	"net"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/armon/go-metrics"
 	"github.com/hashicorp/consul/consul/structs"
 	"github.com/hashicorp/raft"
 	"github.com/hashicorp/serf/serf"
-	"net"
-	"strconv"
-	"time"
 )
 
 const (
-	SerfCheckID       = "serfHealth"
-	SerfCheckName     = "Serf Health Status"
-	ConsulServiceID   = "consul"
-	ConsulServiceName = "consul"
-	newLeaderEvent    = "consul:new-leader"
+	SerfCheckID           = "serfHealth"
+	SerfCheckName         = "Serf Health Status"
+	SerfCheckAliveOutput  = "Agent alive and reachable"
+	SerfCheckFailedOutput = "Agent not live or unreachable"
+	ConsulServiceID       = "consul"
+	ConsulServiceName     = "consul"
+	newLeaderEvent        = "consul:new-leader"
 )
 
 // monitorLeadership is used to monitor if we acquire or lose our role
@@ -45,6 +50,9 @@ func (s *Server) monitorLeadership() {
 // leaderLoop runs as long as we are the leader to run various
 // maintence activities
 func (s *Server) leaderLoop(stopCh chan struct{}) {
+	// Ensure we revoke leadership on stepdown
+	defer s.revokeLeadership()
+
 	// Fire a user event indicating a new leader
 	payload := []byte(s.config.NodeName)
 	if err := s.serfLAN.UserEvent(newLeaderEvent, payload, false); err != nil {
@@ -54,6 +62,7 @@ func (s *Server) leaderLoop(stopCh chan struct{}) {
 	// Reconcile channel is only used once initial reconcile
 	// has succeeded
 	var reconcileCh chan serf.Member
+	establishedLeader := false
 
 RECONCILE:
 	// Setup a reconciliation timer
@@ -68,6 +77,16 @@ RECONCILE:
 		goto WAIT
 	}
 	metrics.MeasureSince([]string{"consul", "leader", "barrier"}, start)
+
+	// Check if we need to handle initial leadership actions
+	if !establishedLeader {
+		if err := s.establishLeadership(); err != nil {
+			s.logger.Printf("[ERR] consul: failed to establish leadership: %v",
+				err)
+			goto WAIT
+		}
+		establishedLeader = true
+	}
 
 	// Reconcile any missing data
 	if err := s.reconcile(); err != nil {
@@ -92,8 +111,128 @@ WAIT:
 			goto RECONCILE
 		case member := <-reconcileCh:
 			s.reconcileMember(member)
+		case index := <-s.tombstoneGC.ExpireCh():
+			go s.reapTombstones(index)
 		}
 	}
+}
+
+// establishLeadership is invoked once we become leader and are able
+// to invoke an initial barrier. The barrier is used to ensure any
+// previously inflight transactions have been commited and that our
+// state is up-to-date.
+func (s *Server) establishLeadership() error {
+	// Hint the tombstone expiration timer. When we freshly establish leadership
+	// we become the authoritative timer, and so we need to start the clock
+	// on any pending GC events.
+	s.tombstoneGC.SetEnabled(true)
+	lastIndex := s.raft.LastIndex()
+	s.tombstoneGC.Hint(lastIndex)
+	s.logger.Printf("[DEBUG] consul: reset tombstone GC to index %d", lastIndex)
+
+	// Setup ACLs if we are the leader and need to
+	if err := s.initializeACL(); err != nil {
+		s.logger.Printf("[ERR] consul: ACL initialization failed: %v", err)
+		return err
+	}
+
+	// Setup the session timers. This is done both when starting up or when
+	// a leader fail over happens. Since the timers are maintained by the leader
+	// node along, effectively this means all the timers are renewed at the
+	// time of failover. The TTL contract is that the session will not be expired
+	// before the TTL, so expiring it later is allowable.
+	//
+	// This MUST be done after the initial barrier to ensure the latest Sessions
+	// are available to be initialized. Otherwise initialization may use stale
+	// data.
+	if err := s.initializeSessionTimers(); err != nil {
+		s.logger.Printf("[ERR] consul: Session Timers initialization failed: %v",
+			err)
+		return err
+	}
+	return nil
+}
+
+// revokeLeadership is invoked once we step down as leader.
+// This is used to cleanup any state that may be specific to a leader.
+func (s *Server) revokeLeadership() error {
+	// Disable the tombstone GC, since it is only useful as a leader
+	s.tombstoneGC.SetEnabled(false)
+
+	// Clear the session timers on either shutdown or step down, since we
+	// are no longer responsible for session expirations.
+	if err := s.clearAllSessionTimers(); err != nil {
+		s.logger.Printf("[ERR] consul: Clearing session timers failed: %v", err)
+		return err
+	}
+	return nil
+}
+
+// initializeACL is used to setup the ACLs if we are the leader
+// and need to do this.
+func (s *Server) initializeACL() error {
+	// Bail if not configured or we are not authoritative
+	authDC := s.config.ACLDatacenter
+	if len(authDC) == 0 || authDC != s.config.Datacenter {
+		return nil
+	}
+
+	// Purge the cache, since it could've changed while we
+	// were not the leader
+	s.aclAuthCache.Purge()
+
+	// Look for the anonymous token
+	state := s.fsm.State()
+	_, acl, err := state.ACLGet(anonymousToken)
+	if err != nil {
+		return fmt.Errorf("failed to get anonymous token: %v", err)
+	}
+
+	// Create anonymous token if missing
+	if acl == nil {
+		req := structs.ACLRequest{
+			Datacenter: authDC,
+			Op:         structs.ACLSet,
+			ACL: structs.ACL{
+				ID:   anonymousToken,
+				Name: "Anonymous Token",
+				Type: structs.ACLTypeClient,
+			},
+		}
+		_, err := s.raftApply(structs.ACLRequestType, &req)
+		if err != nil {
+			return fmt.Errorf("failed to create anonymous token: %v", err)
+		}
+	}
+
+	// Check for configured master token
+	master := s.config.ACLMasterToken
+	if len(master) == 0 {
+		return nil
+	}
+
+	// Look for the master token
+	_, acl, err = state.ACLGet(master)
+	if err != nil {
+		return fmt.Errorf("failed to get master token: %v", err)
+	}
+	if acl == nil {
+		req := structs.ACLRequest{
+			Datacenter: authDC,
+			Op:         structs.ACLSet,
+			ACL: structs.ACL{
+				ID:   master,
+				Name: "Master Token",
+				Type: structs.ACLTypeManagement,
+			},
+		}
+		_, err := s.raftApply(structs.ACLRequestType, &req)
+		if err != nil {
+			return fmt.Errorf("failed to create master token: %v", err)
+		}
+
+	}
+	return nil
 }
 
 // reconcile is used to reconcile the differences between Serf
@@ -121,8 +260,8 @@ func (s *Server) reconcile() (err error) {
 // a "reap" event to cause the node to be cleaned up.
 func (s *Server) reconcileReaped(known map[string]struct{}) error {
 	state := s.fsm.State()
-	_, critical := state.ChecksInState(structs.HealthCritical)
-	for _, check := range critical {
+	_, checks := state.ChecksInState(structs.HealthAny)
+	for _, check := range checks {
 		// Ignore any non serf checks
 		if check.CheckID != SerfCheckID {
 			continue
@@ -189,6 +328,11 @@ func (s *Server) reconcileMember(member serf.Member) error {
 	if err != nil {
 		s.logger.Printf("[ERR] consul: failed to reconcile member: %v: %v",
 			member, err)
+
+		// Permission denied should not bubble up
+		if strings.Contains(err.Error(), permissionDenied) {
+			return nil
+		}
 		return err
 	}
 	return nil
@@ -266,7 +410,9 @@ AFTER_CHECK:
 			CheckID: SerfCheckID,
 			Name:    SerfCheckName,
 			Status:  structs.HealthPassing,
+			Output:  SerfCheckAliveOutput,
 		},
+		WriteRequest: structs.WriteRequest{Token: s.config.ACLToken},
 	}
 	var out struct{}
 	return s.endpoints.Catalog.Register(&req, &out)
@@ -300,7 +446,9 @@ func (s *Server) handleFailedMember(member serf.Member) error {
 			CheckID: SerfCheckID,
 			Name:    SerfCheckName,
 			Status:  structs.HealthCritical,
+			Output:  SerfCheckFailedOutput,
 		},
+		WriteRequest: structs.WriteRequest{Token: s.config.ACLToken},
 	}
 	var out struct{}
 	return s.endpoints.Catalog.Register(&req, &out)
@@ -321,22 +469,30 @@ func (s *Server) handleReapMember(member serf.Member) error {
 // handleDeregisterMember is used to deregister a member of a given reason
 func (s *Server) handleDeregisterMember(reason string, member serf.Member) error {
 	state := s.fsm.State()
+	// Do not deregister ourself. This can only happen if the current leader
+	// is leaving. Instead, we should allow a follower to take-over and
+	// deregister us later.
+	if member.Name == s.config.NodeName {
+		s.logger.Printf("[WARN] consul: deregistering self (%s) should be done by follower", s.config.NodeName)
+		return nil
+	}
+
+	// Remove from Raft peers if this was a server
+	if valid, parts := isConsulServer(member); valid {
+		s.logger.Printf("[INFO] consul: server '%s' %s, removing as peer", member.Name, reason)
+		if err := s.removeConsulServer(member, parts.Port); err != nil {
+			return err
+		}
+	}
 
 	// Check if the node does not exists
 	_, found, _ := state.GetNode(member.Name)
 	if !found {
 		return nil
 	}
-	s.logger.Printf("[INFO] consul: member '%s' %s, deregistering", member.Name, reason)
-
-	// Remove from Raft peers if this was a server
-	if valid, parts := isConsulServer(member); valid {
-		if err := s.removeConsulServer(member, parts.Port); err != nil {
-			return err
-		}
-	}
 
 	// Deregister the node
+	s.logger.Printf("[INFO] consul: member '%s' %s, deregistering", member.Name, reason)
 	req := structs.DeregisterRequest{
 		Datacenter: s.config.Datacenter,
 		Node:       member.Name,
@@ -376,11 +532,6 @@ func (s *Server) joinConsulServer(m serf.Member, parts *serverParts) error {
 
 // removeConsulServer is used to try to remove a consul server that has left
 func (s *Server) removeConsulServer(m serf.Member, port int) error {
-	// Do not remove ourself
-	if m.Name == s.config.NodeName {
-		return nil
-	}
-
 	// Attempt to remove as peer
 	peer := &net.TCPAddr{IP: m.Addr, Port: port}
 	future := s.raft.RemovePeer(peer)
@@ -390,4 +541,25 @@ func (s *Server) removeConsulServer(m serf.Member, port int) error {
 		return err
 	}
 	return nil
+}
+
+// reapTombstones is invoked by the current leader to manage garbage
+// collection of tombstones. When a key is deleted, we trigger a tombstone
+// GC clock. Once the expiration is reached, this routine is invoked
+// to clear all tombstones before this index. This must be replicated
+// through Raft to ensure consistency. We do this outside the leader loop
+// to avoid blocking.
+func (s *Server) reapTombstones(index uint64) {
+	defer metrics.MeasureSince([]string{"consul", "leader", "reapTombstones"}, time.Now())
+	req := structs.TombstoneRequest{
+		Datacenter:   s.config.Datacenter,
+		Op:           structs.TombstoneReap,
+		ReapIndex:    index,
+		WriteRequest: structs.WriteRequest{Token: s.config.ACLToken},
+	}
+	_, err := s.raftApply(structs.TombstoneRequestType, &req)
+	if err != nil {
+		s.logger.Printf("[ERR] consul: failed to reap tombstones up to %d: %v",
+			index, err)
+	}
 }

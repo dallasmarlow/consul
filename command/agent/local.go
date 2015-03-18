@@ -1,18 +1,24 @@
 package agent
 
 import (
-	"github.com/hashicorp/consul/consul"
-	"github.com/hashicorp/consul/consul/structs"
+	"fmt"
 	"log"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/hashicorp/consul/consul"
+	"github.com/hashicorp/consul/consul/structs"
 )
 
 const (
 	syncStaggerIntv = 3 * time.Second
 	syncRetryIntv   = 15 * time.Second
+
+	// permissionDenied is returned when an ACL based rejection happens
+	permissionDenied = "Permission denied"
 )
 
 // syncStatus is used to represent the difference between
@@ -47,6 +53,9 @@ type localState struct {
 	checks      map[string]*structs.HealthCheck
 	checkStatus map[string]syncStatus
 
+	// Used to track checks that are being deferred
+	deferCheck map[string]*time.Timer
+
 	// consulCh is used to inform of a change to the known
 	// consul nodes. This may be used to retry a sync run
 	consulCh chan struct{}
@@ -64,6 +73,7 @@ func (l *localState) Init(config *Config, logger *log.Logger) {
 	l.serviceStatus = make(map[string]syncStatus)
 	l.checks = make(map[string]*structs.HealthCheck)
 	l.checkStatus = make(map[string]syncStatus)
+	l.deferCheck = make(map[string]*time.Timer)
 	l.consulCh = make(chan struct{}, 1)
 	l.triggerCh = make(chan struct{}, 1)
 }
@@ -92,13 +102,13 @@ func (l *localState) ConsulServerUp() {
 	}
 }
 
-// Pause is used to pause state syncronization, this can be
+// Pause is used to pause state synchronization, this can be
 // used to make batch changes
 func (l *localState) Pause() {
 	atomic.StoreInt32(&l.paused, 1)
 }
 
-// Resume is used to resume state syncronization
+// Resume is used to resume state synchronization
 func (l *localState) Resume() {
 	atomic.StoreInt32(&l.paused, 0)
 	l.changeMade()
@@ -191,6 +201,27 @@ func (l *localState) UpdateCheck(checkID, status, output string) {
 		return
 	}
 
+	// Defer a sync if the output has changed. This is an optimization around
+	// frequent updates of output. Instead, we update the output internally,
+	// and periodically do a write-back to the servers. If there is a status
+	// change we do the write immediately.
+	if l.config.CheckUpdateInterval > 0 && check.Status == status {
+		check.Output = output
+		if _, ok := l.deferCheck[checkID]; !ok {
+			deferSync := time.AfterFunc(l.config.CheckUpdateInterval, func() {
+				l.Lock()
+				if _, ok := l.checkStatus[checkID]; ok {
+					l.checkStatus[checkID] = syncStatus{inSync: false}
+					l.changeMade()
+				}
+				delete(l.deferCheck, checkID)
+				l.Unlock()
+			})
+			l.deferCheck[checkID] = deferSync
+		}
+		return
+	}
+
 	// Update status and mark out of sync
 	check.Status = status
 	check.Output = output
@@ -230,7 +261,7 @@ SYNC:
 			case <-shutdownCh:
 				return
 			}
-		case <-time.After(randomStagger(aeScale(syncRetryIntv, len(l.iface.LANMembers())))):
+		case <-time.After(syncRetryIntv + randomStagger(aeScale(syncRetryIntv, len(l.iface.LANMembers())))):
 		case <-shutdownCh:
 			return
 		}
@@ -267,8 +298,9 @@ SYNC:
 // the local syncStatus as appropriate
 func (l *localState) setSyncState() error {
 	req := structs.NodeSpecificRequest{
-		Datacenter: l.config.Datacenter,
-		Node:       l.config.NodeName,
+		Datacenter:   l.config.Datacenter,
+		Node:         l.config.NodeName,
+		QueryOptions: structs.QueryOptions{Token: l.config.ACLToken},
 	}
 	var out1 structs.IndexedNodeServices
 	var out2 structs.IndexedHealthChecks
@@ -289,11 +321,6 @@ func (l *localState) setSyncState() error {
 			// If we don't have the service locally, deregister it
 			existing, ok := l.services[id]
 			if !ok {
-				// The Consul service is created automatically, and
-				// does not need to be registered
-				if id == consul.ConsulServiceID && l.config.Server {
-					continue
-				}
 				l.serviceStatus[id] = syncStatus{remoteDelete: true}
 				continue
 			}
@@ -319,7 +346,18 @@ func (l *localState) setSyncState() error {
 		}
 
 		// If our definition is different, we need to update it
-		equal := reflect.DeepEqual(existing, check)
+		var equal bool
+		if l.config.CheckUpdateInterval == 0 {
+			equal = reflect.DeepEqual(existing, check)
+		} else {
+			eCopy := new(structs.HealthCheck)
+			*eCopy = *existing
+			eCopy.Output = ""
+			check.Output = ""
+			equal = reflect.DeepEqual(eCopy, check)
+		}
+
+		// Update the status
 		l.checkStatus[id] = syncStatus{inSync: equal}
 	}
 	return nil
@@ -353,6 +391,12 @@ func (l *localState) syncChanges() error {
 				return err
 			}
 		} else if !status.inSync {
+			// Cancel a deferred sync
+			if timer := l.deferCheck[id]; timer != nil {
+				timer.Stop()
+				delete(l.deferCheck, id)
+			}
+
 			if err := l.syncCheck(id); err != nil {
 				return err
 			}
@@ -365,10 +409,15 @@ func (l *localState) syncChanges() error {
 
 // deleteService is used to delete a service from the server
 func (l *localState) deleteService(id string) error {
+	if id == "" {
+		return fmt.Errorf("ServiceID missing")
+	}
+
 	req := structs.DeregisterRequest{
-		Datacenter: l.config.Datacenter,
-		Node:       l.config.NodeName,
-		ServiceID:  id,
+		Datacenter:   l.config.Datacenter,
+		Node:         l.config.NodeName,
+		ServiceID:    id,
+		WriteRequest: structs.WriteRequest{Token: l.config.ACLToken},
 	}
 	var out struct{}
 	err := l.iface.RPC("Catalog.Deregister", &req, &out)
@@ -381,10 +430,15 @@ func (l *localState) deleteService(id string) error {
 
 // deleteCheck is used to delete a service from the server
 func (l *localState) deleteCheck(id string) error {
+	if id == "" {
+		return fmt.Errorf("CheckID missing")
+	}
+
 	req := structs.DeregisterRequest{
-		Datacenter: l.config.Datacenter,
-		Node:       l.config.NodeName,
-		CheckID:    id,
+		Datacenter:   l.config.Datacenter,
+		Node:         l.config.NodeName,
+		CheckID:      id,
+		WriteRequest: structs.WriteRequest{Token: l.config.ACLToken},
 	}
 	var out struct{}
 	err := l.iface.RPC("Catalog.Deregister", &req, &out)
@@ -398,16 +452,47 @@ func (l *localState) deleteCheck(id string) error {
 // syncService is used to sync a service to the server
 func (l *localState) syncService(id string) error {
 	req := structs.RegisterRequest{
-		Datacenter: l.config.Datacenter,
-		Node:       l.config.NodeName,
-		Address:    l.config.AdvertiseAddr,
-		Service:    l.services[id],
+		Datacenter:   l.config.Datacenter,
+		Node:         l.config.NodeName,
+		Address:      l.config.AdvertiseAddr,
+		Service:      l.services[id],
+		WriteRequest: structs.WriteRequest{Token: l.config.ACLToken},
 	}
+
+	// If the service has associated checks that are out of sync,
+	// piggyback them on the service sync so they are part of the
+	// same transaction and are registered atomically.
+	var checks structs.HealthChecks
+	for _, check := range l.checks {
+		if check.ServiceID == id {
+			if stat, ok := l.checkStatus[check.CheckID]; !ok || !stat.inSync {
+				checks = append(checks, check)
+			}
+		}
+	}
+
+	// Backwards-compatibility for Consul < 0.5
+	if len(checks) == 1 {
+		req.Check = checks[0]
+	} else {
+		req.Checks = checks
+	}
+
 	var out struct{}
 	err := l.iface.RPC("Catalog.Register", &req, &out)
 	if err == nil {
 		l.serviceStatus[id] = syncStatus{inSync: true}
 		l.logger.Printf("[INFO] agent: Synced service '%s'", id)
+		for _, check := range checks {
+			l.checkStatus[check.CheckID] = syncStatus{inSync: true}
+		}
+	} else if strings.Contains(err.Error(), permissionDenied) {
+		l.serviceStatus[id] = syncStatus{inSync: true}
+		l.logger.Printf("[WARN] agent: Service '%s' registration blocked by ACLs", id)
+		for _, check := range checks {
+			l.checkStatus[check.CheckID] = syncStatus{inSync: true}
+		}
+		return nil
 	}
 	return err
 }
@@ -423,17 +508,22 @@ func (l *localState) syncCheck(id string) error {
 		}
 	}
 	req := structs.RegisterRequest{
-		Datacenter: l.config.Datacenter,
-		Node:       l.config.NodeName,
-		Address:    l.config.AdvertiseAddr,
-		Service:    service,
-		Check:      l.checks[id],
+		Datacenter:   l.config.Datacenter,
+		Node:         l.config.NodeName,
+		Address:      l.config.AdvertiseAddr,
+		Service:      service,
+		Check:        l.checks[id],
+		WriteRequest: structs.WriteRequest{Token: l.config.ACLToken},
 	}
 	var out struct{}
 	err := l.iface.RPC("Catalog.Register", &req, &out)
 	if err == nil {
 		l.checkStatus[id] = syncStatus{inSync: true}
 		l.logger.Printf("[INFO] agent: Synced check '%s'", id)
+	} else if strings.Contains(err.Error(), permissionDenied) {
+		l.checkStatus[id] = syncStatus{inSync: true}
+		l.logger.Printf("[WARN] agent: Check '%s' registration blocked by ACLs", id)
+		return nil
 	}
 	return err
 }

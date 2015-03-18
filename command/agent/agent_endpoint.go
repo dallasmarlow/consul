@@ -5,6 +5,7 @@ import (
 	"github.com/hashicorp/consul/consul/structs"
 	"github.com/hashicorp/serf/serf"
 	"net/http"
+	"strconv"
 	"strings"
 )
 
@@ -97,30 +98,50 @@ func (s *HTTPServer) AgentRegisterCheck(resp http.ResponseWriter, req *http.Requ
 	}
 
 	// Add the check
-	return nil, s.agent.AddCheck(health, chkType)
+	if err := s.agent.AddCheck(health, chkType, true); err != nil {
+		return nil, err
+	}
+	s.syncChanges()
+	return nil, nil
 }
 
 func (s *HTTPServer) AgentDeregisterCheck(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
 	checkID := strings.TrimPrefix(req.URL.Path, "/v1/agent/check/deregister/")
-	return nil, s.agent.RemoveCheck(checkID)
+	if err := s.agent.RemoveCheck(checkID, true); err != nil {
+		return nil, err
+	}
+	s.syncChanges()
+	return nil, nil
 }
 
 func (s *HTTPServer) AgentCheckPass(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
 	checkID := strings.TrimPrefix(req.URL.Path, "/v1/agent/check/pass/")
 	note := req.URL.Query().Get("note")
-	return nil, s.agent.UpdateCheck(checkID, structs.HealthPassing, note)
+	if err := s.agent.UpdateCheck(checkID, structs.HealthPassing, note); err != nil {
+		return nil, err
+	}
+	s.syncChanges()
+	return nil, nil
 }
 
 func (s *HTTPServer) AgentCheckWarn(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
 	checkID := strings.TrimPrefix(req.URL.Path, "/v1/agent/check/warn/")
 	note := req.URL.Query().Get("note")
-	return nil, s.agent.UpdateCheck(checkID, structs.HealthWarning, note)
+	if err := s.agent.UpdateCheck(checkID, structs.HealthWarning, note); err != nil {
+		return nil, err
+	}
+	s.syncChanges()
+	return nil, nil
 }
 
 func (s *HTTPServer) AgentCheckFail(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
 	checkID := strings.TrimPrefix(req.URL.Path, "/v1/agent/check/fail/")
 	note := req.URL.Query().Get("note")
-	return nil, s.agent.UpdateCheck(checkID, structs.HealthCritical, note)
+	if err := s.agent.UpdateCheck(checkID, structs.HealthCritical, note); err != nil {
+		return nil, err
+	}
+	s.syncChanges()
+	return nil, nil
 }
 
 func (s *HTTPServer) AgentRegisterService(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
@@ -132,17 +153,25 @@ func (s *HTTPServer) AgentRegisterService(resp http.ResponseWriter, req *http.Re
 			return nil
 		}
 
-		var check interface{}
 		for k, v := range rawMap {
-			if strings.ToLower(k) == "check" {
-				check = v
+			switch strings.ToLower(k) {
+			case "check":
+				if err := FixupCheckType(v); err != nil {
+					return err
+				}
+			case "checks":
+				chkTypes, ok := v.([]interface{})
+				if !ok {
+					continue
+				}
+				for _, chkType := range chkTypes {
+					if err := FixupCheckType(chkType); err != nil {
+						return err
+					}
+				}
 			}
 		}
-		if check == nil {
-			return nil
-		}
-
-		return FixupCheckType(check)
+		return nil
 	}
 	if err := decodeBody(req, &args, decodeCB); err != nil {
 		resp.WriteHeader(400)
@@ -161,18 +190,118 @@ func (s *HTTPServer) AgentRegisterService(resp http.ResponseWriter, req *http.Re
 	ns := args.NodeService()
 
 	// Verify the check type
-	chkType := args.CheckType()
-	if chkType != nil && !chkType.Valid() {
-		resp.WriteHeader(400)
-		resp.Write([]byte("Must provide TTL or Script and Interval!"))
-		return nil, nil
+	chkTypes := args.CheckTypes()
+	for _, check := range chkTypes {
+		if !check.Valid() {
+			resp.WriteHeader(400)
+			resp.Write([]byte("Must provide TTL or Script and Interval!"))
+			return nil, nil
+		}
 	}
 
 	// Add the check
-	return nil, s.agent.AddService(ns, chkType)
+	if err := s.agent.AddService(ns, chkTypes, true); err != nil {
+		return nil, err
+	}
+	s.syncChanges()
+	return nil, nil
 }
 
 func (s *HTTPServer) AgentDeregisterService(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
 	serviceID := strings.TrimPrefix(req.URL.Path, "/v1/agent/service/deregister/")
-	return nil, s.agent.RemoveService(serviceID)
+	if err := s.agent.RemoveService(serviceID, true); err != nil {
+		return nil, err
+	}
+	s.syncChanges()
+	return nil, nil
+}
+
+func (s *HTTPServer) AgentServiceMaintenance(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	// Only PUT supported
+	if req.Method != "PUT" {
+		resp.WriteHeader(405)
+		return nil, nil
+	}
+
+	// Ensure we have a service ID
+	serviceID := strings.TrimPrefix(req.URL.Path, "/v1/agent/service/maintenance/")
+	if serviceID == "" {
+		resp.WriteHeader(400)
+		resp.Write([]byte("Missing service ID"))
+		return nil, nil
+	}
+
+	// Ensure we have some action
+	params := req.URL.Query()
+	if _, ok := params["enable"]; !ok {
+		resp.WriteHeader(400)
+		resp.Write([]byte("Missing value for enable"))
+		return nil, nil
+	}
+
+	raw := params.Get("enable")
+	enable, err := strconv.ParseBool(raw)
+	if err != nil {
+		resp.WriteHeader(400)
+		resp.Write([]byte(fmt.Sprintf("Invalid value for enable: %q", raw)))
+		return nil, nil
+	}
+
+	if enable {
+		reason := params.Get("reason")
+		if err = s.agent.EnableServiceMaintenance(serviceID, reason); err != nil {
+			resp.WriteHeader(404)
+			resp.Write([]byte(err.Error()))
+			return nil, nil
+		}
+	} else {
+		if err = s.agent.DisableServiceMaintenance(serviceID); err != nil {
+			resp.WriteHeader(404)
+			resp.Write([]byte(err.Error()))
+			return nil, nil
+		}
+	}
+	s.syncChanges()
+	return nil, nil
+}
+
+func (s *HTTPServer) AgentNodeMaintenance(resp http.ResponseWriter, req *http.Request) (interface{}, error) {
+	// Only PUT supported
+	if req.Method != "PUT" {
+		resp.WriteHeader(405)
+		return nil, nil
+	}
+
+	// Ensure we have some action
+	params := req.URL.Query()
+	if _, ok := params["enable"]; !ok {
+		resp.WriteHeader(400)
+		resp.Write([]byte("Missing value for enable"))
+		return nil, nil
+	}
+
+	raw := params.Get("enable")
+	enable, err := strconv.ParseBool(raw)
+	if err != nil {
+		resp.WriteHeader(400)
+		resp.Write([]byte(fmt.Sprintf("Invalid value for enable: %q", raw)))
+		return nil, nil
+	}
+
+	if enable {
+		s.agent.EnableNodeMaintenance(params.Get("reason"))
+	} else {
+		s.agent.DisableNodeMaintenance()
+	}
+	s.syncChanges()
+	return nil, nil
+}
+
+// syncChanges is a helper function which wraps a blocking call to sync
+// services and checks to the server. If the operation fails, we only
+// only warn because the write did succeed and anti-entropy will sync later.
+func (s *HTTPServer) syncChanges() {
+	if err := s.agent.state.syncChanges(); err != nil {
+		s.logger.Printf("[ERR] agent: failed to sync changes: %v", err)
+	}
 }

@@ -3,11 +3,12 @@ package agent
 import (
 	"bytes"
 	"fmt"
-	"github.com/hashicorp/consul/consul/structs"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/hashicorp/consul/consul/structs"
 )
 
 const (
@@ -50,7 +51,6 @@ func (s *HTTPServer) KVSEndpoint(resp http.ResponseWriter, req *http.Request) (i
 		resp.WriteHeader(405)
 		return nil, nil
 	}
-	return nil, nil
 }
 
 // KVSGet handles a GET request
@@ -136,6 +136,9 @@ func (s *HTTPServer) KVSPut(resp http.ResponseWriter, req *http.Request, args *s
 	if missingKey(resp, args) {
 		return nil, nil
 	}
+	if conflictingFlags(resp, req, "cas", "acquire", "release") {
+		return nil, nil
+	}
 	applyReq := structs.KVSRequest{
 		Datacenter: args.Datacenter,
 		Op:         structs.KVSSet,
@@ -145,6 +148,7 @@ func (s *HTTPServer) KVSPut(resp http.ResponseWriter, req *http.Request, args *s
 			Value: nil,
 		},
 	}
+	applyReq.Token = args.Token
 
 	// Check for flags
 	params := req.URL.Query()
@@ -208,6 +212,9 @@ func (s *HTTPServer) KVSPut(resp http.ResponseWriter, req *http.Request, args *s
 
 // KVSPut handles a DELETE request
 func (s *HTTPServer) KVSDelete(resp http.ResponseWriter, req *http.Request, args *structs.KeyRequest) (interface{}, error) {
+	if conflictingFlags(resp, req, "recurse", "cas") {
+		return nil, nil
+	}
 	applyReq := structs.KVSRequest{
 		Datacenter: args.Datacenter,
 		Op:         structs.KVSDelete,
@@ -215,6 +222,7 @@ func (s *HTTPServer) KVSDelete(resp http.ResponseWriter, req *http.Request, args
 			Key: args.Key,
 		},
 	}
+	applyReq.Token = args.Token
 
 	// Check for recurse
 	params := req.URL.Query()
@@ -224,12 +232,28 @@ func (s *HTTPServer) KVSDelete(resp http.ResponseWriter, req *http.Request, args
 		return nil, nil
 	}
 
+	// Check for cas value
+	if _, ok := params["cas"]; ok {
+		casVal, err := strconv.ParseUint(params.Get("cas"), 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		applyReq.DirEnt.ModifyIndex = casVal
+		applyReq.Op = structs.KVSDeleteCAS
+	}
+
 	// Make the RPC
 	var out bool
 	if err := s.agent.RPC("KVS.Apply", &applyReq, &out); err != nil {
 		return nil, err
 	}
-	return nil, nil
+
+	// Only use the out value if this was a CAS
+	if applyReq.Op == structs.KVSDeleteCAS {
+		return out, nil
+	} else {
+		return true, nil
+	}
 }
 
 // missingKey checks if the key is missing
@@ -239,5 +263,24 @@ func missingKey(resp http.ResponseWriter, args *structs.KeyRequest) bool {
 		resp.Write([]byte("Missing key name"))
 		return true
 	}
+	return false
+}
+
+// conflictingFlags determines if non-composable flags were passed in a request.
+func conflictingFlags(resp http.ResponseWriter, req *http.Request, flags ...string) bool {
+	params := req.URL.Query()
+
+	found := false
+	for _, conflict := range flags {
+		if _, ok := params[conflict]; ok {
+			if found {
+				resp.WriteHeader(400)
+				resp.Write([]byte("Conflicting flags: " + params.Encode()))
+				return true
+			}
+			found = true
+		}
+	}
+
 	return false
 }

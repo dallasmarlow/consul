@@ -14,7 +14,7 @@ health and the nodes they run on.
 on each and the health of the node.
 - Key/value view and update
 
-It's aware of multiple data centers, so you can get a quick global
+It's aware of multiple datacenters, so you can get a quick global
 overview before drilling into specific data-centers for detailed
 views.
 
@@ -44,6 +44,13 @@ An example of this command, from inside the `ui/` directory, would be:
 
     consul agent -bootstrap -server -data-dir /tmp/ -ui-dir .
 
+Basic tests can be run by adding the `?test` query parameter to the
+application.
+
+When developing Consul, it's recommended that you use the included
+development configuration.
+
+    consul agent -config-file=development_config.json
 
 ### Releasing
 

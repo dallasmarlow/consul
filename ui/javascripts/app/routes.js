@@ -3,6 +3,15 @@
 //
 App.BaseRoute = Ember.Route.extend({
   rootKey: '',
+  condensedView: false,
+
+  // Don't record characters in browser history
+  // for the "search" query item (filter)
+  queryParams: {
+    filter: {
+      replace: true
+    }
+  },
 
   getParentAndGrandparent: function(key) {
     var parentKey = this.rootKey,
@@ -23,7 +32,7 @@ App.BaseRoute = Ember.Route.extend({
       parent: parentKey,
       grandParent: grandParentKey,
       isRoot: parentKey === '/'
-    }
+    };
   },
 
   removeDuplicateKeys: function(keys, matcher) {
@@ -43,12 +52,12 @@ App.BaseRoute = Ember.Route.extend({
     // like parents and grandParents
     linkToKey: function(key) {
       if (key == "/") {
-        this.transitionTo('kv.show', "")
+        this.transitionTo('kv.show', "");
       }
       else if (key.slice(-1) === '/' || key === this.rootKey) {
-        this.transitionTo('kv.show', key)
+        this.transitionTo('kv.show', key);
       } else {
-        this.transitionTo('kv.edit', key)
+        this.transitionTo('kv.edit', key);
       }
     }
   }
@@ -61,8 +70,8 @@ App.IndexRoute = App.BaseRoute.extend({
   // Retrieve the list of datacenters
   model: function(params) {
     return Ember.$.getJSON('/v1/catalog/datacenters').then(function(data) {
-      return data
-    })
+      return data;
+    });
   },
 
   afterModel: function(model, transition) {
@@ -84,8 +93,8 @@ App.DcRoute = App.BaseRoute.extend({
     return Ember.RSVP.hash({
       dc: params.dc,
       dcs: Ember.$.getJSON('/v1/catalog/datacenters'),
-      nodes: Ember.$.getJSON('/v1/internal/ui/nodes?dc=' + params.dc).then(function(data) {
-        objs = [];
+      nodes: Ember.$.getJSON(formatUrl('/v1/internal/ui/nodes', params.dc)).then(function(data) {
+        var objs = [];
 
         // Merge the nodes into a list and create objects out of them
         data.map(function(obj){
@@ -107,7 +116,7 @@ App.DcRoute = App.BaseRoute.extend({
 
 App.KvIndexRoute = App.BaseRoute.extend({
   beforeModel: function() {
-    this.transitionTo('kv.show', this.rootKey)
+    this.transitionTo('kv.show', this.rootKey);
   }
 });
 
@@ -115,13 +124,14 @@ App.KvShowRoute = App.BaseRoute.extend({
   model: function(params) {
     var key = params.key;
     var dc = this.modelFor('dc').dc;
+    var token = App.get('settings.token');
 
     // Return a promise has with the ?keys for that namespace
     // and the original key requested in params
     return Ember.RSVP.hash({
       key: key,
-      keys: Ember.$.getJSON('/v1/kv/' + key + '?keys&seperator=' + '/&dc=' + dc).then(function(data) {
-        objs = [];
+      keys: Ember.$.getJSON(formatUrl('/v1/kv/' + key + '?keys&seperator=/', dc, token)).then(function(data) {
+        var objs = [];
         data.map(function(obj){
           objs.push(App.Key.create({Key: obj}));
         });
@@ -148,22 +158,37 @@ App.KvEditRoute = App.BaseRoute.extend({
   model: function(params) {
     var key = params.key;
     var dc = this.modelFor('dc').dc;
-    var parentKeys = this.getParentAndGrandparent(key)
+    var parentKeys = this.getParentAndGrandparent(key);
+    var token = App.get('settings.token');
 
     // Return a promise hash to get the data for both columns
     return Ember.RSVP.hash({
-      key: Ember.$.getJSON('/v1/kv/' + key + '?dc=' + dc).then(function(data) {
+      dc: dc,
+      token: token,
+      key: Ember.$.getJSON(formatUrl('/v1/kv/' + key, dc, token)).then(function(data) {
         // Convert the returned data to a Key
         return App.Key.create().setProperties(data[0]);
       }),
-      keys: keysPromise = Ember.$.getJSON('/v1/kv/' + parentKeys.parent + '?keys&seperator=' + '/' + '&dc=' + dc).then(function(data) {
-        objs = [];
+      keys: keysPromise = Ember.$.getJSON(formatUrl('/v1/kv/' + parentKeys.parent + '?keys&seperator=/', dc, token)).then(function(data) {
+        var objs = [];
         data.map(function(obj){
          objs.push(App.Key.create({Key: obj}));
         });
         return objs;
       }),
     });
+  },
+
+  // Load the session on the key, if there is one
+  afterModel: function(models) {
+    if (models.key.get('isLocked')) {
+      return Ember.$.getJSON(formatUrl('/v1/session/info/' + models.key.Session, models.dc, models.token)).then(function(data) {
+        models.session = data[0];
+        return models;
+      });
+    } else {
+      return models;
+    }
   },
 
   setupController: function(controller, models) {
@@ -177,19 +202,22 @@ App.KvEditRoute = App.BaseRoute.extend({
     controller.set('isRoot', parentKeys.isRoot);
     controller.set('siblings', models.keys);
     controller.set('rootKey', this.rootKey);
+    controller.set('session', models.session);
   }
 });
 
 App.ServicesRoute = App.BaseRoute.extend({
   model: function(params) {
-    var dc = this.modelFor('dc').dc
+    var dc = this.modelFor('dc').dc;
+    var token = App.get('settings.token');
+
     // Return a promise to retrieve all of the services
-    return Ember.$.getJSON('/v1/internal/ui/services?dc=' + dc).then(function(data) {
-      objs = [];
+    return Ember.$.getJSON(formatUrl('/v1/internal/ui/services', dc, token)).then(function(data) {
+      var objs = [];
       data.map(function(obj){
        objs.push(App.Service.create(obj));
       });
-      return objs
+      return objs;
     });
   },
   setupController: function(controller, model) {
@@ -200,35 +228,62 @@ App.ServicesRoute = App.BaseRoute.extend({
 
 App.ServicesShowRoute = App.BaseRoute.extend({
   model: function(params) {
-    var dc = this.modelFor('dc').dc
+    var dc = this.modelFor('dc').dc;
+    var token = App.get('settings.token');
+
     // Here we just use the built-in health endpoint, as it gives us everything
     // we need.
-    return Ember.$.getJSON('/v1/health/service/' + params.name + '?dc=' + dc).then(function(data) {
-      objs = [];
+    return Ember.$.getJSON(formatUrl('/v1/health/service/' + params.name, dc, token)).then(function(data) {
+      var objs = [];
       data.map(function(obj){
        objs.push(App.Node.create(obj));
       });
       return objs;
     });
+  },
+  setupController: function(controller, model) {
+    var tags = [];
+    model.map(function(obj){
+      tags = tags.concat(obj.Service.Tags);
+    });
+
+    tags = tags.filter(function(n){ return n !== undefined; });
+    tags = tags.uniq().join(', ');
+
+    controller.set('content', model);
+    controller.set('tags', tags);
   }
 });
 
 App.NodesShowRoute = App.BaseRoute.extend({
   model: function(params) {
-    var dc = this.modelFor('dc').dc
+    var dc = this.modelFor('dc').dc;
+    var token = App.get('settings.token');
+
     // Return a promise hash of the node and nodes
     return Ember.RSVP.hash({
-      node: Ember.$.getJSON('/v1/internal/ui/node/' + params.name + '?dc=' + dc).then(function(data) {
-        return App.Node.create(data)
+      dc: dc,
+      token: token,
+      node: Ember.$.getJSON(formatUrl('/v1/internal/ui/node/' + params.name, dc, token)).then(function(data) {
+        return App.Node.create(data);
       }),
-      nodes: Ember.$.getJSON('/v1/internal/ui/node/' + params.name + '?dc=' + dc).then(function(data) {
-        return App.Node.create(data)
+      nodes: Ember.$.getJSON(formatUrl('/v1/internal/ui/node/' + params.name, dc, token)).then(function(data) {
+        return App.Node.create(data);
       })
+    });
+  },
+
+  // Load the sessions for the node
+  afterModel: function(models) {
+    return Ember.$.getJSON(formatUrl('/v1/session/node/' + models.node.Node, models.dc, models.token)).then(function(data) {
+      models.sessions = data;
+      return models;
     });
   },
 
   setupController: function(controller, models) {
       controller.set('content', models.node);
+      controller.set('sessions', models.sessions);
       //
       // Since we have 2 column layout, we need to also display the
       // list of nodes on the left. Hence setting the attribute
@@ -240,17 +295,98 @@ App.NodesShowRoute = App.BaseRoute.extend({
 
 App.NodesRoute = App.BaseRoute.extend({
   model: function(params) {
-    var dc = this.modelFor('dc').dc
+    var dc = this.modelFor('dc').dc;
+    var token = App.get('settings.token');
+
     // Return a promise containing the nodes
-    return Ember.$.getJSON('/v1/internal/ui/nodes?dc=' + dc).then(function(data) {
-      objs = [];
+    return Ember.$.getJSON(formatUrl('/v1/internal/ui/nodes', dc, token)).then(function(data) {
+      var objs = [];
       data.map(function(obj){
        objs.push(App.Node.create(obj));
       });
-      return objs
+      return objs;
     });
   },
   setupController: function(controller, model) {
-      controller.set('nodes', model);
+    controller.set('nodes', model);
   }
 });
+
+
+App.AclsRoute = App.BaseRoute.extend({
+  model: function(params) {
+    var dc = this.modelFor('dc').dc;
+    var token = App.get('settings.token');
+    // Return a promise containing the ACLS
+    return Ember.$.getJSON(formatUrl('/v1/acl/list', dc, token)).then(function(data) {
+      var objs = [];
+      data.map(function(obj){
+        if (obj.ID === "anonymous") {
+          objs.unshift(App.Acl.create(obj));
+        } else {
+          objs.push(App.Acl.create(obj));
+        }
+      });
+      return objs;
+    });
+  },
+
+  actions: {
+    error: function(error, transition) {
+      // If consul returns 401, ACLs are disabled
+      if (error && error.status === 401) {
+        this.transitionTo('dc.aclsdisabled');
+      // If consul returns 403, they key isn't authorized for that
+      // action.
+      } else if (error && error.status === 403) {
+        this.transitionTo('dc.unauthorized');
+      }
+      return true;
+    }
+  },
+
+  setupController: function(controller, model) {
+      controller.set('acls', model);
+      controller.set('newAcl', App.Acl.create());
+  }
+});
+
+App.AclsShowRoute = App.BaseRoute.extend({
+  model: function(params) {
+    var dc = this.modelFor('dc').dc;
+    var token = App.get('settings.token');
+
+    // Return a promise hash of the node and nodes
+    return Ember.RSVP.hash({
+      dc: dc,
+      acl: Ember.$.getJSON(formatUrl('/v1/acl/info/'+ params.id, dc, token)).then(function(data) {
+        return App.Acl.create(data[0]);
+      })
+    });
+  },
+
+  setupController: function(controller, models) {
+      controller.set('content', models.acl);
+  }
+});
+
+App.SettingsRoute = App.BaseRoute.extend({
+  model: function(params) {
+    return App.get('settings');
+  }
+});
+
+
+// Adds any global parameters we need to set to a url/path
+function formatUrl(url, dc, token) {
+  if (url.indexOf("?") > 0) {
+    // If our url has existing params
+    url = url + "&dc=" + dc;
+    url = url + "&token=" + token;
+  } else {
+    // Our url doesn't have params
+    url = url + "?dc=" + dc;
+    url = url + "&token=" + token;
+  }
+  return url;
+}

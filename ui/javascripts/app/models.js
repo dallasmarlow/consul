@@ -8,13 +8,14 @@ App.Service = Ember.Object.extend({
   failingChecks: function() {
     // If the service was returned from `/v1/internal/ui/services`
     // then we have a aggregated value which we can just grab
-    if (this.get('ChecksCritical') != undefined) {
-      return (this.get('ChecksCritical') + this.get('ChecksWarning'))
+    if (this.get('ChecksCritical') !== undefined) {
+      return (this.get('ChecksCritical') + this.get('ChecksWarning'));
     // Otherwise, we need to filter the child checks by both failing
     // states
     } else {
-    return (checks.filterBy('Status', 'critical').get('length') +
-      checks.filterBy('Status', 'warning').get('length'))
+      var checks = this.get('Checks');
+      return (checks.filterBy('Status', 'critical').get('length') +
+        checks.filterBy('Status', 'warning').get('length'));
     }
   }.property('Checks'),
 
@@ -24,8 +25,8 @@ App.Service = Ember.Object.extend({
   passingChecks: function() {
     // If the service was returned from `/v1/internal/ui/services`
     // then we have a aggregated value which we can just grab
-    if (this.get('ChecksPassing') != undefined) {
-      return this.get('ChecksPassing')
+    if (this.get('ChecksPassing') !== undefined) {
+      return this.get('ChecksPassing');
     // Otherwise, we need to filter the child checks by both failing
     // states
     } else {
@@ -45,13 +46,25 @@ App.Service = Ember.Object.extend({
     }
   }.property('Checks'),
 
+  nodes: function() {
+    return (this.get('Nodes'));
+  }.property('Nodes'),
+
   //
   // Boolean of whether or not there are failing checks in the service.
   // This is used to set color backgrounds and so on.
   //
   hasFailingChecks: function() {
     return (this.get('failingChecks') > 0);
-  }.property('Checks')
+  }.property('Checks'),
+
+  //
+  // Key used for filtering through an array of this model, i.e s
+  // searching
+  //
+  filterKey: function() {
+    return this.get('Name');
+  }.property('Name'),
 });
 
 //
@@ -65,7 +78,7 @@ App.Node = Ember.Object.extend({
     var checks = this.get('Checks');
     // We view both warning and critical as failing
     return (checks.filterBy('Status', 'critical').get('length') +
-      checks.filterBy('Status', 'warning').get('length'))
+      checks.filterBy('Status', 'warning').get('length'));
   }.property('Checks'),
 
   //
@@ -93,7 +106,24 @@ App.Node = Ember.Object.extend({
   //
   hasFailingChecks: function() {
     return (this.get('failingChecks') > 0);
-  }.property('Checks')
+  }.property('Checks'),
+
+  //
+  // The number of services on the node
+  //
+  numServices: function() {
+    return (this.get('Services').length);
+  }.property('Services'),
+  // The number of services on the node
+  //
+
+  services: function() {
+    return (this.get('Services'));
+  }.property('Services'),
+
+  filterKey: function() {
+    return this.get('Node');
+  }.property('Node')
 });
 
 
@@ -123,17 +153,26 @@ App.Key = Ember.Object.extend(Ember.Validations.Mixin, {
   isFolder: function() {
     if (this.get('Key') === undefined) {
       return false;
-    };
-    return (this.get('Key').slice(-1) === '/')
+    }
+    return (this.get('Key').slice(-1) === '/');
   }.property('Key'),
+
+  // Boolean if the key is locked or now
+  isLocked: function() {
+    if (!this.get('Session')) {
+      return false;
+    } else {
+      return true;
+    }
+  }.property('Session'),
 
   // Determines what route to link to. If it's a folder,
   // it will link to kv.show. Otherwise, kv.edit
   linkToRoute: function() {
     if (this.get('Key').slice(-1) === '/') {
-      return 'kv.show'
+      return 'kv.show';
     } else {
-      return 'kv.edit'
+      return 'kv.edit';
     }
   }.property('Key'),
 
@@ -200,3 +239,44 @@ App.Key = Ember.Object.extend(Ember.Validations.Mixin, {
     return parts.join("/") + "/";
   }.property('Key')
 });
+
+//
+// An ACL
+//
+App.Acl = Ember.Object.extend({
+  isNotAnon: function() {
+    if (this.get('ID') === "anonymous"){
+      return false;
+    } else {
+      return true;
+    }
+  }.property('ID')
+});
+
+// Wrap localstorage with an ember object
+App.Settings = Ember.Object.extend({
+  unknownProperty: function(key) {
+    return localStorage[key];
+  },
+
+  setUnknownProperty: function(key, value) {
+    if(Ember.isNone(value)) {
+      delete localStorage[key];
+    } else {
+      localStorage[key] = value;
+    }
+    this.notifyPropertyChange(key);
+    return value;
+  },
+
+  clear: function() {
+    this.beginPropertyChanges();
+    for (var i=0, l=localStorage.length; i<l; i++){
+      this.set(localStorage.key(i));
+    }
+    localStorage.clear();
+    this.endPropertyChanges();
+  }
+});
+
+

@@ -2,9 +2,11 @@ package consul
 
 import (
 	"fmt"
+	"sort"
+	"time"
+
 	"github.com/armon/go-metrics"
 	"github.com/hashicorp/consul/consul/structs"
-	"time"
 )
 
 // Catalog endpoint is used to manipulate the service catalog
@@ -34,14 +36,32 @@ func (c *Catalog) Register(args *structs.RegisterRequest, reply *struct{}) error
 		if args.Service.ID != "" && args.Service.Service == "" {
 			return fmt.Errorf("Must provide service name with ID")
 		}
+
+		// Apply the ACL policy if any
+		// The 'consul' service is excluded since it is managed
+		// automatically internally.
+		if args.Service.Service != ConsulServiceName {
+			acl, err := c.srv.resolveToken(args.Token)
+			if err != nil {
+				return err
+			} else if acl != nil && !acl.ServiceWrite(args.Service.Service) {
+				c.srv.logger.Printf("[WARN] consul.catalog: Register of service '%s' on '%s' denied due to ACLs",
+					args.Service.Service, args.Node)
+				return permissionDeniedErr
+			}
+		}
 	}
 
 	if args.Check != nil {
-		if args.Check.CheckID == "" && args.Check.Name != "" {
-			args.Check.CheckID = args.Check.Name
+		args.Checks = append(args.Checks, args.Check)
+		args.Check = nil
+	}
+	for _, check := range args.Checks {
+		if check.CheckID == "" && check.Name != "" {
+			check.CheckID = check.Name
 		}
-		if args.Check.Node == "" {
-			args.Check.Node = args.Node
+		if check.Node == "" {
+			check.Node = args.Node
 		}
 	}
 
@@ -50,6 +70,7 @@ func (c *Catalog) Register(args *structs.RegisterRequest, reply *struct{}) error
 		c.srv.logger.Printf("[ERR] consul.catalog: Register failed: %v", err)
 		return err
 	}
+
 	return nil
 }
 
@@ -83,6 +104,9 @@ func (c *Catalog) ListDatacenters(args *struct{}, reply *[]string) error {
 	for dc := range c.srv.remoteConsuls {
 		dcs = append(dcs, dc)
 	}
+
+	// Sort the DCs
+	sort.Strings(dcs)
 
 	// Return
 	*reply = dcs

@@ -24,15 +24,17 @@ package agent
 import (
 	"bufio"
 	"fmt"
-	"github.com/hashicorp/logutils"
-	"github.com/hashicorp/serf/serf"
-	"github.com/ugorji/go/codec"
 	"io"
 	"log"
 	"net"
 	"os"
 	"strings"
 	"sync"
+
+	"github.com/hashicorp/consul/consul/structs"
+	"github.com/hashicorp/go-msgpack/codec"
+	"github.com/hashicorp/logutils"
+	"github.com/hashicorp/serf/serf"
 )
 
 const (
@@ -50,6 +52,11 @@ const (
 	monitorCommand    = "monitor"
 	leaveCommand      = "leave"
 	statsCommand      = "stats"
+	reloadCommand     = "reload"
+	installKeyCommand = "install-key"
+	useKeyCommand     = "use-key"
+	removeKeyCommand  = "remove-key"
+	listKeysCommand   = "list-keys"
 )
 
 const (
@@ -59,6 +66,13 @@ const (
 	handshakeRequired     = "Handshake required"
 	monitorExists         = "Monitor already exists"
 )
+
+// msgpackHandle is a shared handle for encoding/decoding of
+// messages
+var msgpackHandle = &codec.MsgpackHandle{
+	RawToString: true,
+	WriteExt:    true,
+}
 
 // Request header is sent before each request
 type requestHeader struct {
@@ -93,6 +107,37 @@ type joinRequest struct {
 
 type joinResponse struct {
 	Num int32
+}
+
+type keyringRequest struct {
+	Key string
+}
+
+type KeyringEntry struct {
+	Datacenter string
+	Pool       string
+	Key        string
+	Count      int
+}
+
+type KeyringMessage struct {
+	Datacenter string
+	Pool       string
+	Node       string
+	Message    string
+}
+
+type KeyringInfo struct {
+	Datacenter string
+	Pool       string
+	NumNodes   int
+	Error      string
+}
+
+type keyringResponse struct {
+	Keys     []KeyringEntry
+	Messages []KeyringMessage
+	Info     []KeyringInfo
 }
 
 type membersResponse struct {
@@ -149,6 +194,7 @@ type AgentRPC struct {
 	listener  net.Listener
 	logger    *log.Logger
 	logWriter *logWriter
+	reloadCh  chan struct{}
 	stop      bool
 	stopCh    chan struct{}
 }
@@ -204,6 +250,7 @@ func NewAgentRPC(agent *Agent, listener net.Listener,
 		listener:  listener,
 		logger:    log.New(logOutput, "", log.LstdFlags),
 		logWriter: logWriter,
+		reloadCh:  make(chan struct{}, 1),
 		stopCh:    make(chan struct{}),
 	}
 	go rpc.listen()
@@ -229,6 +276,12 @@ func (i *AgentRPC) Shutdown() {
 	}
 }
 
+// ReloadCh returns a channel that can be watched for
+// when a reload is being triggered.
+func (i *AgentRPC) ReloadCh() <-chan struct{} {
+	return i.reloadCh
+}
+
 // listen is a long running routine that listens for new clients
 func (i *AgentRPC) listen() {
 	for {
@@ -249,10 +302,8 @@ func (i *AgentRPC) listen() {
 			reader: bufio.NewReader(conn),
 			writer: bufio.NewWriter(conn),
 		}
-		client.dec = codec.NewDecoder(client.reader,
-			&codec.MsgpackHandle{RawToString: true, WriteExt: true})
-		client.enc = codec.NewEncoder(client.writer,
-			&codec.MsgpackHandle{RawToString: true, WriteExt: true})
+		client.dec = codec.NewDecoder(client.reader, msgpackHandle)
+		client.enc = codec.NewEncoder(client.writer, msgpackHandle)
 		if err != nil {
 			i.logger.Printf("[ERR] agent.rpc: Failed to create decoder: %v", err)
 			conn.Close()
@@ -355,6 +406,12 @@ func (i *AgentRPC) handleRequest(client *rpcClient, reqHeader *requestHeader) er
 
 	case statsCommand:
 		return i.handleStats(client, seq)
+
+	case reloadCommand:
+		return i.handleReload(client, seq)
+
+	case installKeyCommand, useKeyCommand, removeKeyCommand, listKeysCommand:
+		return i.handleKeyring(client, seq, command)
 
 	default:
 		respHeader := responseHeader{Seq: seq, Error: unsupportedCommand}
@@ -552,6 +609,92 @@ func (i *AgentRPC) handleStats(client *rpcClient, seq uint64) error {
 	}
 	resp := i.agent.Stats()
 	return client.Send(&header, resp)
+}
+
+func (i *AgentRPC) handleReload(client *rpcClient, seq uint64) error {
+	// Push to the reload channel
+	select {
+	case i.reloadCh <- struct{}{}:
+	default:
+	}
+
+	// Always succeed
+	resp := responseHeader{Seq: seq, Error: ""}
+	return client.Send(&resp, nil)
+}
+
+func (i *AgentRPC) handleKeyring(client *rpcClient, seq uint64, cmd string) error {
+	var req keyringRequest
+	var queryResp *structs.KeyringResponses
+	var r keyringResponse
+	var err error
+
+	if cmd != listKeysCommand {
+		if err = client.dec.Decode(&req); err != nil {
+			return fmt.Errorf("decode failed: %v", err)
+		}
+	}
+
+	switch cmd {
+	case listKeysCommand:
+		queryResp, err = i.agent.ListKeys()
+	case installKeyCommand:
+		queryResp, err = i.agent.InstallKey(req.Key)
+	case useKeyCommand:
+		queryResp, err = i.agent.UseKey(req.Key)
+	case removeKeyCommand:
+		queryResp, err = i.agent.RemoveKey(req.Key)
+	default:
+		respHeader := responseHeader{Seq: seq, Error: unsupportedCommand}
+		client.Send(&respHeader, nil)
+		return fmt.Errorf("command '%s' not recognized", cmd)
+	}
+
+	header := responseHeader{
+		Seq:   seq,
+		Error: errToString(err),
+	}
+
+	if queryResp == nil {
+		goto SEND
+	}
+
+	for _, kr := range queryResp.Responses {
+		var pool string
+		if kr.WAN {
+			pool = "WAN"
+		} else {
+			pool = "LAN"
+		}
+		for node, message := range kr.Messages {
+			msg := KeyringMessage{
+				Datacenter: kr.Datacenter,
+				Pool:       pool,
+				Node:       node,
+				Message:    message,
+			}
+			r.Messages = append(r.Messages, msg)
+		}
+		for key, qty := range kr.Keys {
+			k := KeyringEntry{
+				Datacenter: kr.Datacenter,
+				Pool:       pool,
+				Key:        key,
+				Count:      qty,
+			}
+			r.Keys = append(r.Keys, k)
+		}
+		info := KeyringInfo{
+			Datacenter: kr.Datacenter,
+			Pool:       pool,
+			NumNodes:   kr.NumNodes,
+			Error:      kr.Error,
+		}
+		r.Info = append(r.Info, info)
+	}
+
+SEND:
+	return client.Send(&header, r)
 }
 
 // Used to convert an error to a string representation

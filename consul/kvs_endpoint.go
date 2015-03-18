@@ -2,9 +2,10 @@ package consul
 
 import (
 	"fmt"
+	"time"
+
 	"github.com/armon/go-metrics"
 	"github.com/hashicorp/consul/consul/structs"
-	"time"
 )
 
 // KVS endpoint is used to manipulate the Key-Value store
@@ -23,6 +24,23 @@ func (k *KVS) Apply(args *structs.KVSRequest, reply *bool) error {
 	// Verify the args
 	if args.DirEnt.Key == "" && args.Op != structs.KVSDeleteTree {
 		return fmt.Errorf("Must provide key")
+	}
+
+	// Apply the ACL policy if any
+	acl, err := k.srv.resolveToken(args.Token)
+	if err != nil {
+		return err
+	} else if acl != nil {
+		switch args.Op {
+		case structs.KVSDeleteTree:
+			if !acl.KeyWritePrefix(args.DirEnt.Key) {
+				return permissionDeniedErr
+			}
+		default:
+			if !acl.KeyWrite(args.DirEnt.Key) {
+				return permissionDeniedErr
+			}
+		}
 	}
 
 	// If this is a lock, we must check for a lock-delay. Since lock-delay
@@ -65,15 +83,25 @@ func (k *KVS) Get(args *structs.KeyRequest, reply *structs.IndexedDirEntries) er
 		return err
 	}
 
+	acl, err := k.srv.resolveToken(args.Token)
+	if err != nil {
+		return err
+	}
+
 	// Get the local state
 	state := k.srv.fsm.State()
-	return k.srv.blockingRPC(&args.QueryOptions,
-		&reply.QueryMeta,
-		state.QueryTables("KVSGet"),
-		func() error {
+	opts := blockingRPCOptions{
+		queryOpts: &args.QueryOptions,
+		queryMeta: &reply.QueryMeta,
+		kvWatch:   true,
+		kvPrefix:  args.Key,
+		run: func() error {
 			index, ent, err := state.KVSGet(args.Key)
 			if err != nil {
 				return err
+			}
+			if acl != nil && !acl.KeyRead(args.Key) {
+				ent = nil
 			}
 			if ent == nil {
 				// Must provide non-zero index to prevent blocking
@@ -89,7 +117,9 @@ func (k *KVS) Get(args *structs.KeyRequest, reply *structs.IndexedDirEntries) er
 				reply.Entries = structs.DirEntries{ent}
 			}
 			return nil
-		})
+		},
+	}
+	return k.srv.blockingRPCOpt(&opts)
 }
 
 // List is used to list all keys with a given prefix
@@ -98,16 +128,27 @@ func (k *KVS) List(args *structs.KeyRequest, reply *structs.IndexedDirEntries) e
 		return err
 	}
 
+	acl, err := k.srv.resolveToken(args.Token)
+	if err != nil {
+		return err
+	}
+
 	// Get the local state
 	state := k.srv.fsm.State()
-	return k.srv.blockingRPC(&args.QueryOptions,
-		&reply.QueryMeta,
-		state.QueryTables("KVSList"),
-		func() error {
-			index, ent, err := state.KVSList(args.Key)
+	opts := blockingRPCOptions{
+		queryOpts: &args.QueryOptions,
+		queryMeta: &reply.QueryMeta,
+		kvWatch:   true,
+		kvPrefix:  args.Key,
+		run: func() error {
+			tombIndex, index, ent, err := state.KVSList(args.Key)
 			if err != nil {
 				return err
 			}
+			if acl != nil {
+				ent = FilterDirEnt(acl, ent)
+			}
+
 			if len(ent) == 0 {
 				// Must provide non-zero index to prevent blocking
 				// Index 1 is impossible anyways (due to Raft internals)
@@ -117,6 +158,7 @@ func (k *KVS) List(args *structs.KeyRequest, reply *structs.IndexedDirEntries) e
 					reply.Index = index
 				}
 				reply.Entries = nil
+
 			} else {
 				// Determine the maximum affected index
 				var maxIndex uint64
@@ -125,12 +167,16 @@ func (k *KVS) List(args *structs.KeyRequest, reply *structs.IndexedDirEntries) e
 						maxIndex = e.ModifyIndex
 					}
 				}
-
+				if tombIndex > maxIndex {
+					maxIndex = tombIndex
+				}
 				reply.Index = maxIndex
 				reply.Entries = ent
 			}
 			return nil
-		})
+		},
+	}
+	return k.srv.blockingRPCOpt(&opts)
 }
 
 // ListKeys is used to list all keys with a given prefix to a seperator
@@ -139,14 +185,28 @@ func (k *KVS) ListKeys(args *structs.KeyListRequest, reply *structs.IndexedKeyLi
 		return err
 	}
 
+	acl, err := k.srv.resolveToken(args.Token)
+	if err != nil {
+		return err
+	}
+
 	// Get the local state
 	state := k.srv.fsm.State()
-	return k.srv.blockingRPC(&args.QueryOptions,
-		&reply.QueryMeta,
-		state.QueryTables("KVSListKeys"),
-		func() error {
-			var err error
-			reply.Index, reply.Keys, err = state.KVSListKeys(args.Prefix, args.Seperator)
+	opts := blockingRPCOptions{
+		queryOpts: &args.QueryOptions,
+		queryMeta: &reply.QueryMeta,
+		kvWatch:   true,
+		kvPrefix:  args.Prefix,
+		run: func() error {
+			index, keys, err := state.KVSListKeys(args.Prefix, args.Seperator)
+			reply.Index = index
+			if acl != nil {
+				keys = FilterKeys(acl, keys)
+			}
+			reply.Keys = keys
 			return err
-		})
+
+		},
+	}
+	return k.srv.blockingRPCOpt(&opts)
 }

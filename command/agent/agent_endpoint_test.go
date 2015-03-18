@@ -7,6 +7,7 @@ import (
 	"github.com/hashicorp/consul/testutil"
 	"github.com/hashicorp/serf/serf"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -31,7 +32,7 @@ func TestHTTPAgentServices(t *testing.T) {
 		t.Fatalf("Err: %v", err)
 	}
 	val := obj.(map[string]*structs.NodeService)
-	if len(val) != 1 {
+	if len(val) != 2 {
 		t.Fatalf("bad services: %v", obj)
 	}
 	if val["mysql"].Port != 5000 {
@@ -288,7 +289,7 @@ func TestHTTPAgentDeregisterCheck(t *testing.T) {
 	defer srv.agent.Shutdown()
 
 	chk := &structs.HealthCheck{Name: "test", CheckID: "test"}
-	if err := srv.agent.AddCheck(chk, nil); err != nil {
+	if err := srv.agent.AddCheck(chk, nil, false); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -320,7 +321,7 @@ func TestHTTPAgentPassCheck(t *testing.T) {
 
 	chk := &structs.HealthCheck{Name: "test", CheckID: "test"}
 	chkType := &CheckType{TTL: 15 * time.Second}
-	if err := srv.agent.AddCheck(chk, chkType); err != nil {
+	if err := srv.agent.AddCheck(chk, chkType, false); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -353,7 +354,7 @@ func TestHTTPAgentWarnCheck(t *testing.T) {
 
 	chk := &structs.HealthCheck{Name: "test", CheckID: "test"}
 	chkType := &CheckType{TTL: 15 * time.Second}
-	if err := srv.agent.AddCheck(chk, chkType); err != nil {
+	if err := srv.agent.AddCheck(chk, chkType, false); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -386,7 +387,7 @@ func TestHTTPAgentFailCheck(t *testing.T) {
 
 	chk := &structs.HealthCheck{Name: "test", CheckID: "test"}
 	chkType := &CheckType{TTL: 15 * time.Second}
-	if err := srv.agent.AddCheck(chk, chkType); err != nil {
+	if err := srv.agent.AddCheck(chk, chkType, false); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -429,6 +430,14 @@ func TestHTTPAgentRegisterService(t *testing.T) {
 		Check: CheckType{
 			TTL: 15 * time.Second,
 		},
+		Checks: CheckTypes{
+			&CheckType{
+				TTL: 20 * time.Second,
+			},
+			&CheckType{
+				TTL: 30 * time.Second,
+			},
+		},
 	}
 	req.Body = encodeReq(args)
 
@@ -446,12 +455,13 @@ func TestHTTPAgentRegisterService(t *testing.T) {
 	}
 
 	// Ensure we have a check mapping
-	if _, ok := srv.agent.state.Checks()["service:test"]; !ok {
-		t.Fatalf("missing test check")
+	checks := srv.agent.state.Checks()
+	if len(checks) != 3 {
+		t.Fatalf("bad: %v", checks)
 	}
 
-	if _, ok := srv.agent.checkTTLs["service:test"]; !ok {
-		t.Fatalf("missing test check ttl")
+	if len(srv.agent.checkTTLs) != 3 {
+		t.Fatalf("missing test check ttls: %v", srv.agent.checkTTLs)
 	}
 }
 
@@ -465,7 +475,7 @@ func TestHTTPAgentDeregisterService(t *testing.T) {
 		ID:      "test",
 		Service: "test",
 	}
-	if err := srv.agent.AddService(service, nil); err != nil {
+	if err := srv.agent.AddService(service, nil, false); err != nil {
 		t.Fatalf("err: %v", err)
 	}
 
@@ -490,5 +500,265 @@ func TestHTTPAgentDeregisterService(t *testing.T) {
 
 	if _, ok := srv.agent.state.Checks()["test"]; ok {
 		t.Fatalf("have test check")
+	}
+}
+
+func TestHTTPAgent_ServiceMaintenanceEndpoint_BadRequest(t *testing.T) {
+	dir, srv := makeHTTPServer(t)
+	defer os.RemoveAll(dir)
+	defer srv.Shutdown()
+	defer srv.agent.Shutdown()
+
+	// Fails on non-PUT
+	req, _ := http.NewRequest("GET", "/v1/agent/service/maintenance/test?enable=true", nil)
+	resp := httptest.NewRecorder()
+	if _, err := srv.AgentServiceMaintenance(resp, req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if resp.Code != 405 {
+		t.Fatalf("expected 405, got %d", resp.Code)
+	}
+
+	// Fails when no enable flag provided
+	req, _ = http.NewRequest("PUT", "/v1/agent/service/maintenance/test", nil)
+	resp = httptest.NewRecorder()
+	if _, err := srv.AgentServiceMaintenance(resp, req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if resp.Code != 400 {
+		t.Fatalf("expected 400, got %d", resp.Code)
+	}
+
+	// Fails when no service ID provided
+	req, _ = http.NewRequest("PUT", "/v1/agent/service/maintenance/?enable=true", nil)
+	resp = httptest.NewRecorder()
+	if _, err := srv.AgentServiceMaintenance(resp, req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if resp.Code != 400 {
+		t.Fatalf("expected 400, got %d", resp.Code)
+	}
+
+	// Fails when bad service ID provided
+	req, _ = http.NewRequest("PUT", "/v1/agent/service/maintenance/_nope_?enable=true", nil)
+	resp = httptest.NewRecorder()
+	if _, err := srv.AgentServiceMaintenance(resp, req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if resp.Code != 404 {
+		t.Fatalf("expected 404, got %d", resp.Code)
+	}
+}
+
+func TestHTTPAgent_EnableServiceMaintenance(t *testing.T) {
+	dir, srv := makeHTTPServer(t)
+	defer os.RemoveAll(dir)
+	defer srv.Shutdown()
+	defer srv.agent.Shutdown()
+
+	// Register the service
+	service := &structs.NodeService{
+		ID:      "test",
+		Service: "test",
+	}
+	if err := srv.agent.AddService(service, nil, false); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Force the service into maintenance mode
+	req, _ := http.NewRequest("PUT", "/v1/agent/service/maintenance/test?enable=true&reason=broken", nil)
+	resp := httptest.NewRecorder()
+	if _, err := srv.AgentServiceMaintenance(resp, req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if resp.Code != 200 {
+		t.Fatalf("expected 200, got %d", resp.Code)
+	}
+
+	// Ensure the maintenance check was registered
+	checkID := serviceMaintCheckID("test")
+	check, ok := srv.agent.state.Checks()[checkID]
+	if !ok {
+		t.Fatalf("should have registered maintenance check")
+	}
+
+	// Ensure the reason was set in notes
+	if check.Notes != "broken" {
+		t.Fatalf("bad: %#v", check)
+	}
+}
+
+func TestHTTPAgent_DisableServiceMaintenance(t *testing.T) {
+	dir, srv := makeHTTPServer(t)
+	defer os.RemoveAll(dir)
+	defer srv.Shutdown()
+	defer srv.agent.Shutdown()
+
+	// Register the service
+	service := &structs.NodeService{
+		ID:      "test",
+		Service: "test",
+	}
+	if err := srv.agent.AddService(service, nil, false); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Force the service into maintenance mode
+	if err := srv.agent.EnableServiceMaintenance("test", ""); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	// Leave maintenance mode
+	req, _ := http.NewRequest("PUT", "/v1/agent/service/maintenance/test?enable=false", nil)
+	resp := httptest.NewRecorder()
+	if _, err := srv.AgentServiceMaintenance(resp, req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if resp.Code != 200 {
+		t.Fatalf("expected 200, got %d", resp.Code)
+	}
+
+	// Ensure the maintenance check was removed
+	checkID := serviceMaintCheckID("test")
+	if _, ok := srv.agent.state.Checks()[checkID]; ok {
+		t.Fatalf("should have removed maintenance check")
+	}
+}
+
+func TestHTTPAgent_NodeMaintenanceEndpoint_BadRequest(t *testing.T) {
+	dir, srv := makeHTTPServer(t)
+	defer os.RemoveAll(dir)
+	defer srv.Shutdown()
+	defer srv.agent.Shutdown()
+
+	// Fails on non-PUT
+	req, _ := http.NewRequest("GET", "/v1/agent/self/maintenance?enable=true", nil)
+	resp := httptest.NewRecorder()
+	if _, err := srv.AgentNodeMaintenance(resp, req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if resp.Code != 405 {
+		t.Fatalf("expected 405, got %d", resp.Code)
+	}
+
+	// Fails when no enable flag provided
+	req, _ = http.NewRequest("PUT", "/v1/agent/self/maintenance", nil)
+	resp = httptest.NewRecorder()
+	if _, err := srv.AgentNodeMaintenance(resp, req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if resp.Code != 400 {
+		t.Fatalf("expected 400, got %d", resp.Code)
+	}
+}
+
+func TestHTTPAgent_EnableNodeMaintenance(t *testing.T) {
+	dir, srv := makeHTTPServer(t)
+	defer os.RemoveAll(dir)
+	defer srv.Shutdown()
+	defer srv.agent.Shutdown()
+
+	// Force the node into maintenance mode
+	req, _ := http.NewRequest(
+		"PUT", "/v1/agent/self/maintenance?enable=true&reason=broken", nil)
+	resp := httptest.NewRecorder()
+	if _, err := srv.AgentNodeMaintenance(resp, req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if resp.Code != 200 {
+		t.Fatalf("expected 200, got %d", resp.Code)
+	}
+
+	// Ensure the maintenance check was registered
+	check, ok := srv.agent.state.Checks()[nodeMaintCheckID]
+	if !ok {
+		t.Fatalf("should have registered maintenance check")
+	}
+
+	// Ensure the reason was set in notes
+	if check.Notes != "broken" {
+		t.Fatalf("bad: %#v", check)
+	}
+}
+
+func TestHTTPAgent_DisableNodeMaintenance(t *testing.T) {
+	dir, srv := makeHTTPServer(t)
+	defer os.RemoveAll(dir)
+	defer srv.Shutdown()
+	defer srv.agent.Shutdown()
+
+	// Force the node into maintenance mode
+	srv.agent.EnableNodeMaintenance("")
+
+	// Leave maintenance mode
+	req, _ := http.NewRequest("PUT", "/v1/agent/self/maintenance?enable=false", nil)
+	resp := httptest.NewRecorder()
+	if _, err := srv.AgentNodeMaintenance(resp, req); err != nil {
+		t.Fatalf("err: %s", err)
+	}
+	if resp.Code != 200 {
+		t.Fatalf("expected 200, got %d", resp.Code)
+	}
+
+	// Ensure the maintenance check was removed
+	if _, ok := srv.agent.state.Checks()[nodeMaintCheckID]; ok {
+		t.Fatalf("should have removed maintenance check")
+	}
+}
+
+func TestHTTPAgentRegisterServiceCheck(t *testing.T) {
+	dir, srv := makeHTTPServer(t)
+	defer os.RemoveAll(dir)
+	defer srv.Shutdown()
+	defer srv.agent.Shutdown()
+
+	// First register the service
+	req, err := http.NewRequest("GET", "/v1/agent/service/register", nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	args := &ServiceDefinition{
+		Name: "memcache",
+		Port: 8000,
+		Check: CheckType{
+			TTL: 15 * time.Second,
+		},
+	}
+	req.Body = encodeReq(args)
+
+	if _, err := srv.AgentRegisterService(nil, req); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Now register an additional check
+	req, err = http.NewRequest("GET", "/v1/agent/check/register", nil)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	checkArgs := &CheckDefinition{
+		Name:      "memcache_check2",
+		ServiceID: "memcache",
+		CheckType: CheckType{
+			TTL: 15 * time.Second,
+		},
+	}
+	req.Body = encodeReq(checkArgs)
+
+	if _, err := srv.AgentRegisterCheck(nil, req); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Ensure we have a check mapping
+	result := srv.agent.state.Checks()
+	if _, ok := result["service:memcache"]; !ok {
+		t.Fatalf("missing memcached check")
+	}
+	if _, ok := result["memcache_check2"]; !ok {
+		t.Fatalf("missing memcache_check2 check")
+	}
+
+	// Make sure the new check is associated with the service
+	if result["memcache_check2"].ServiceID != "memcache" {
+		t.Fatalf("bad: %#v", result["memcached_check2"])
 	}
 }

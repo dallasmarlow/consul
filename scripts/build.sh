@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
 # This script builds the application from source.
 set -e
@@ -14,6 +14,7 @@ cd $DIR
 # Get the git commit
 GIT_COMMIT=$(git rev-parse HEAD)
 GIT_DIRTY=$(test -n "`git status --porcelain`" && echo "+CHANGES" || true)
+GIT_DESCRIBE=$(git describe --tags)
 
 # If we're building on Windows, specify an extension
 EXTENSION=""
@@ -28,7 +29,12 @@ fi
 
 if [ "$(go env GOOS)" = "freebsd" ]; then
   export CC="clang"
-  export CGO_LDFLAGS="$CGO_LDFLAGS -extld clang" # Workaround for https://code.google.com/p/go/issues/detail?id=6845
+fi
+
+# On OSX, we need to use an older target to ensure binaries are
+# compatible with older linkers
+if [ "$(go env GOOS)" = "darwin" ]; then
+    export MACOSX_DEPLOYMENT_TARGET=10.6
 fi
 
 # Install dependencies
@@ -40,7 +46,7 @@ go get \
 # Build!
 echo "--> Building..."
 go build \
-    -ldflags "${CGO_LDFLAGS} -X main.GitCommit ${GIT_COMMIT}${GIT_DIRTY}" \
+    -ldflags "${CGO_LDFLAGS} -X main.GitCommit ${GIT_COMMIT}${GIT_DIRTY} -X main.GitDescribe ${GIT_DESCRIBE}" \
     -v \
     -o bin/consul${EXTENSION}
 cp bin/consul${EXTENSION} ${GOPATHSINGLE}/bin

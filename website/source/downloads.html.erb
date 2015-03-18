@@ -2,6 +2,8 @@
 layout: "downloads"
 page_title: "Download Consul"
 sidebar_current: "downloads-consul"
+description: |-
+  Below are all available downloads for the latest version of Consul. Please download the proper package for your operating system and architecture.
 ---
 
 <h1>Download Consul</h1>
@@ -17,29 +19,36 @@ sidebar_current: "downloads-consul"
 			</p>
 		</div>
 	</div>
-	<% $consul_os.each do |os| %>
+
+  <div class="row">
+    <div class="col-md-12 download center">
+      <a href="https://dl.bintray.com/mitchellh/consul/<%= latest_version %>_web_ui.zip" class="btn btn-lg btn-default">
+        Download Consul Web UI
+      </a>
+    </div>
+  </div>
+
+	<% product_versions.each do |os, versions| %>
 		<div class="row">
-		<div class="col-md-12 download">
-			<div class="icon pull-left"><%= image_tag "/images/icons/icon_#{os}.png" %>
-		</div>
-			<div class="details">
-				<h2 class="os-name"><%= download_os_human(os) %></h2>
-				<ul>
-					<% $consul_files[os].each do |file| %>
-						<li><a href="<%= download_url(file) %>"><%= download_arch(file) %></a></li>
-				<% end %>
-				</ul>
-				<div class="clearfix">
-				</div>
-			</div>
-		</div>
-	</div>
-<% end %>
+  		<div class="col-md-12 download">
+  			<div class="icon pull-left"><%= system_icon(os) %></div>
+    		<div class="details">
+    			<h2 class="os-name"><%= os %></h2>
+    			<ul>
+    				<% versions.each do |url| %>
+    					<li><a href="<%= url %>"><%= arch_for_filename(url) %></a></li>
+    			  <% end %>
+    			</ul>
+    			<div class="clearfix"></div>
+    		</div>
+    	</div>
+    </div>
+  <% end %>
 
 	<div class="row">
 		<div class="col-md-12 poweredby">
 			<a href='http://www.bintray.com'>
-				<img src='http://www.bintray.com/docs/images/poweredByBintray_ColorTransparent.png'>
+				<img src="https://www.bintray.com/docs/images/poweredByBintray_ColorTransparent.png">
 			</a>
 		</div>
 	</div>

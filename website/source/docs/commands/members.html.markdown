@@ -2,13 +2,15 @@
 layout: "docs"
 page_title: "Commands: Members"
 sidebar_current: "docs-commands-members"
+description: |-
+  The `members` command outputs the current list of members that a Consul agent knows about, along with their state. The state of a node can only be alive, left, or failed.
 ---
 
 # Consul Members
 
 Command: `consul members`
 
-The members command outputs the current list of members that a Consul
+The `members` command outputs the current list of members that a Consul
 agent knows about, along with their state. The state of a node can only
 be "alive", "left", or "failed".
 
@@ -22,12 +24,13 @@ Usage: `consul members [options]`
 
 The command-line flags are all optional. The list of available flags are:
 
-* `-role` - If provided, output is filtered to only nodes matching
-  the regular expression for role
+* `-detailed` - If provided, output shows more detailed information
+  about each node.
 
 * `-rpc-addr` - Address to the RPC server of the agent you want to contact
-  to send this command. If this isn't specified, the command will contact
-  "127.0.0.1:8400 " which is the default RPC address of a Consul agent.
+  to send this command.If this isn't specified, the command checks the
+  CONSUL_RPC_ADDR env variable. If this isn't set, the default RPC 
+  address will be set to "127.0.0.1:8400".
 
 * `-status` - If provided, output is filtered to only nodes matching
   the regular expression for status
